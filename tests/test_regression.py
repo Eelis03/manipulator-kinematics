@@ -12,10 +12,28 @@ difference in the file is the record of that decision.
 
 Tolerances differ by quantity. Forward kinematics is pure arithmetic on the DH
 table and is pinned tightly. Singular values come from LAPACK and are pinned
-relatively. Inverse kinematics solutions are pinned at the solver tolerance,
-which is the accuracy the solver actually promises, and iteration counts are
-allowed to move by one because a change of one unit in the last place at the
-tolerance boundary can cost or save a step.
+relatively. Iteration counts are allowed to move by one because a change of one
+unit in the last place at the tolerance boundary can cost or save a step.
+
+Inverse kinematics solutions are pinned differently depending on whether the
+solver converged, because only one of the two cases has a reproducible answer.
+
+A converged solution is pinned by the tolerance criterion itself: the solver
+stopped because the pose error fell below 1e-6, so the configuration is
+determined by the target to that accuracy on any platform. Those rows are
+compared directly.
+
+A non-converged solution is not a contract. When the Jacobian transpose method
+exhausts its iteration budget, the returned configuration is an arbitrary point
+part way down a slow descent, and on a redundant or near-singular chain it can
+drift a long way through the null space while barely changing the pose error.
+Two platforms whose BLAS reduces a dot product in a different order will land on
+visibly different joint angles after two hundred iterations. Pinning those angles
+records the machine, not the library. What is reproducible, and what actually
+encodes the solver's behaviour, is how far the iterate still is from the target,
+so non-converged rows are pinned on the final residual instead. The relative
+tolerance is loose on purpose: a genuine regression in a descent method moves the
+residual by orders of magnitude, not by parts per million.
 """
 
 from __future__ import annotations
@@ -132,8 +150,15 @@ def _build_reference() -> dict[str, Any]:
                         "iterations": [
                             trial.result.iterations for trial in trace.for_solver(name)
                         ],
+                        "converged": [
+                            bool(trial.result.converged) for trial in trace.for_solver(name)
+                        ],
                         "solutions": [
                             [float(value) for value in trial.result.q]
+                            for trial in trace.for_solver(name)
+                        ],
+                        "final_residuals": [
+                            float(trial.result.final_residual)
                             for trial in trace.for_solver(name)
                         ],
                     }
@@ -239,8 +264,22 @@ def test_campaign_matches_the_reference(reference: dict[str, Any]) -> None:
             iterations = np.array([trial.result.iterations for trial in trials])
             assert np.all(np.abs(iterations - np.array(record["iterations"])) <= 1), label
 
+            converged = np.array([trial.result.converged for trial in trials], dtype=bool)
+            assert converged.tolist() == record["converged"], f"{label}: convergence pattern"
+
             solutions = np.array([trial.result.q for trial in trials], dtype=np.float64)
-            assert np.allclose(solutions, np.array(record["solutions"]), atol=1e-5), label
+            expected_solutions = np.array(record["solutions"], dtype=np.float64)
+            assert np.allclose(
+                solutions[converged], expected_solutions[converged], atol=1e-5
+            ), f"{label}: converged solutions"
+
+            residuals = np.array(
+                [trial.result.final_residual for trial in trials], dtype=np.float64
+            )
+            expected_residuals = np.array(record["final_residuals"], dtype=np.float64)
+            assert np.allclose(
+                residuals[~converged], expected_residuals[~converged], rtol=1e-3, atol=1e-12
+            ), f"{label}: non-converged residuals"
 
 
 if __name__ == "__main__":  # pragma: no cover - regeneration entry point
