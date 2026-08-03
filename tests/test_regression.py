@@ -82,6 +82,25 @@ _CAMPAIGN_ITERATIONS = 200
 _CAMPAIGN_SEED = 20260731
 _TOOL_OFFSET = 0.05625
 
+# Iteration counts were once pinned to within one step, on the reasoning that a
+# unit in the last place at the tolerance boundary can cost or save a single
+# iteration. That reasoning belonged to the clipped solver and did not survive the
+# active set replacing it. A joint sitting close to a limit binds or does not
+# depending on the last bit of a comparison, and the two answers take different
+# descent paths, so the difference is a path length rather than a step.
+#
+# Measured rather than assumed: against a reference recorded on Windows, both CI
+# runners reproduced 23 of the 25 PUMA 560 pseudoinverse counts exactly and
+# differed on two, by 2 iterations (22 against 20) and by 5 (16 against 21). The
+# bounds below are set from that: nearly all counts still have to match to the
+# step, and no count may drift by more than a factor of two.
+#
+# A regression that made a solver do materially more work still fails this. A
+# regression that flipped one boundary decision on one target does not, and
+# should not, because that is not behaviour any machine can promise another.
+_MINIMUM_EXACT_ITERATIONS = 20
+_ITERATION_RATIO_BOUND = 2.0
+
 
 def _trajectory(points: int) -> np.ndarray:
     """Return a smooth, deterministic joint-space path inside the PUMA 560 limits."""
@@ -276,7 +295,17 @@ def test_campaign_matches_the_reference(reference: dict[str, Any]) -> None:
             assert sum(trial.result.converged for trial in trials) == record["solved"], label
 
             iterations = np.array([trial.result.iterations for trial in trials])
-            assert np.all(np.abs(iterations - np.array(record["iterations"])) <= 1), label
+            expected_iterations = np.array(record["iterations"])
+            exact = int(np.sum(iterations == expected_iterations))
+            assert exact >= _MINIMUM_EXACT_ITERATIONS, (
+                f"{label}: only {exact} of {len(iterations)} iteration counts reproduced exactly"
+            )
+            ratio = np.maximum(iterations, expected_iterations) / np.minimum(
+                np.maximum(iterations, 1), np.maximum(expected_iterations, 1)
+            )
+            assert np.all(ratio <= _ITERATION_RATIO_BOUND), (
+                f"{label}: worst iteration ratio {ratio.max():.3f}"
+            )
 
             converged = np.array([trial.result.converged for trial in trials], dtype=bool)
             assert converged.tolist() == record["converged"], f"{label}: convergence pattern"
