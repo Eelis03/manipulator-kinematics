@@ -1,4 +1,4 @@
-"""Tier one: properties and invariants of the kinematics.
+"""Properties and invariants of the kinematics.
 
 Each test states a mathematical fact that must hold for any correct
 implementation, and checks it either against a hand computation or against an
@@ -12,24 +12,38 @@ import pytest
 
 from manipulator_kinematics.algorithm import (
     AnalyticIK,
+    DampedLeastSquaresIK,
+    DampingSchedule,
+    PseudoinverseIK,
+    SolverSettings,
     Tolerance,
+    active_set_step,
     analytic_ik,
     assert_spherical_wrist,
+    blocked_joints,
     conditioning,
+    damped_step,
     finite_difference_jacobian,
     forward_kinematics,
     geometric_jacobian,
     link_frames,
     manipulability,
     numerical_solvers,
+    pseudoinverse_step,
+    residual_damping,
+    transpose_step,
+    variable_damping,
 )
 from manipulator_kinematics.algorithm.analytic import StructureError
 from manipulator_kinematics.model import (
     DHConvention,
     DHParameter,
+    JointLimit,
     JointType,
     Robot,
     chain_reach,
+    clamp_to_limits,
+    identity_pose,
     is_rotation,
     link_transform,
     pose_error,
@@ -403,6 +417,75 @@ def test_analytic_ik_rejects_arms_without_a_spherical_wrist() -> None:
         assert_spherical_wrist(stanford_arm())
 
 
+def test_analytic_ik_rejects_the_wrong_convention_and_the_wrong_joint_count() -> None:
+    """The structure check names the convention and the joint count before the table."""
+    standard = puma560()
+    modified = Robot(name="craig", links=standard.links, convention=DHConvention.MODIFIED)
+    with pytest.raises(StructureError, match="standard DH convention"):
+        assert_spherical_wrist(modified)
+
+    short = Robot(name="five", links=standard.links[:5])
+    with pytest.raises(StructureError, match="expected 6 joints, got 5"):
+        assert_spherical_wrist(short)
+
+
+def test_analytic_ik_rejects_a_target_that_is_not_a_pose() -> None:
+    """A target of the wrong shape is an error, not a silent reshape."""
+    with pytest.raises(ValueError, match="4x4 transform"):
+        analytic_ik(puma560(), np.eye(3, dtype=np.float64))
+
+
+def test_analytic_ik_returns_nothing_when_the_wrist_centre_is_on_the_shoulder_axis() -> None:
+    """A wrist centre inside the shoulder offset cylinder is unreachable."""
+    robot = puma560()
+    target = np.eye(4, dtype=np.float64)
+    assert analytic_ik(robot, target) == ()
+
+
+def test_analytic_ik_solves_a_chain_that_declares_no_joint_limits() -> None:
+    """Without limits every branch is feasible and no angle is remapped."""
+    limited = puma560(tool_offset=0.05625)
+    unlimited = Robot(
+        name="puma560-unlimited",
+        links=tuple(
+            DHParameter(d=link.d, theta=link.theta, a=link.a, alpha=link.alpha)
+            for link in limited.links
+        ),
+        convention=limited.convention,
+    )
+    assert not unlimited.has_limits
+    q = np.array([0.4, -1.1, 0.7, -0.5, 0.9, 0.3], dtype=np.float64)
+    branches = analytic_ik(unlimited, forward_kinematics(unlimited, q))
+    assert len(branches) == 8
+    assert all(branch.feasible for branch in branches)
+    assert all(abs(value) <= np.pi + 1e-12 for branch in branches for value in branch.q)
+
+
+def test_analytic_ik_handles_the_reversed_wrist_singularity() -> None:
+    """At ``q5 = pi`` the wrist is degenerate with the two z axes opposed."""
+    robot = puma560(tool_offset=0.05625)
+    q = np.array([0.3, -0.9, 0.6, 0.4, np.pi, 0.2], dtype=np.float64)
+    branches = analytic_ik(robot, forward_kinematics(robot, q))
+    degenerate = [branch for branch in branches if branch.wrist == "degenerate"]
+    assert degenerate
+    for branch in branches:
+        assert branch.position_error < 1e-9
+        assert branch.orientation_error < 1e-9
+
+
+def test_analytic_solver_reports_failure_when_no_branch_qualifies() -> None:
+    """An unreachable target returns the seed, unconverged, with a stated reason."""
+    robot = puma560(tool_offset=0.05625)
+    target = np.eye(4, dtype=np.float64)
+    target[:3, 3] = [5.0, 5.0, 5.0]
+    seed = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
+    result = AnalyticIK().solve(robot, target, seed)
+    assert not result.converged
+    assert result.iterations == 0
+    assert np.allclose(result.q, seed, atol=0.0)
+    assert result.message == "no closed-form branch satisfied the tolerance"
+
+
 def test_analytic_solver_picks_the_branch_nearest_the_seed() -> None:
     """The solver interface returns the feasible branch closest to the seed."""
     robot = puma560(tool_offset=0.05625)
@@ -485,8 +568,6 @@ def test_solver_rejects_a_wrong_length_seed() -> None:
 
 def test_damping_schedules_bound_the_step_differently() -> None:
     """Near a singularity the damped step is far smaller than the pseudoinverse step."""
-    from manipulator_kinematics.algorithm import damped_step, pseudoinverse_step
-
     robot = puma560()
     near = np.array([0.3, -0.9, 0.6, 0.4, 1e-3, 0.2], dtype=np.float64)
     jacobian = geometric_jacobian(robot, near)
@@ -494,3 +575,319 @@ def test_damping_schedules_bound_the_step_differently() -> None:
     plain = float(np.linalg.norm(pseudoinverse_step(jacobian, twist)))
     regularised = float(np.linalg.norm(damped_step(jacobian, twist, 0.05)))
     assert plain > 100.0 * regularised
+
+
+def test_undamped_damped_least_squares_is_the_pseudoinverse() -> None:
+    """Zero damping is the limit of the damped rule, and stays defined at rank loss."""
+    robot = puma560()
+    jacobian = geometric_jacobian(robot, np.array([0.3, -0.9, 0.6, 0.4, 0.5, 0.2]))
+    twist = np.array([0.02, -0.01, 0.03, 0.05, -0.02, 0.01], dtype=np.float64)
+    assert np.allclose(
+        damped_step(jacobian, twist, 0.0), pseudoinverse_step(jacobian, twist), atol=1e-9
+    )
+
+    narrow = jacobian[:, :3]
+    assert np.allclose(
+        damped_step(narrow, twist, 0.0), pseudoinverse_step(narrow, twist), atol=1e-12
+    )
+
+
+def test_the_singular_region_schedule_survives_the_active_set(
+    rng: np.random.Generator,
+) -> None:
+    """Undamped steps on a held-back Jacobian must not ask for a singular inverse.
+
+    The Chiaverini schedule returns zero damping outside the singular region. Once
+    the active set holds a joint, the reduced Jacobian has fewer than six columns
+    and ``J J^T`` is singular, so the undamped normal equations have no solution.
+    """
+    robot = puma560()
+    solver = DampedLeastSquaresIK(
+        settings=SolverSettings(max_iterations=80, tolerance=Tolerance(1e-6, 1e-6)),
+        schedule=DampingSchedule.SINGULAR_REGION,
+    )
+    lower = np.array([limit.lower for limit in robot.limits], dtype=np.float64)
+    for _ in range(20):
+        q = sample_within_limits(robot.limits, rng, margin=0.15)
+        result = solver.solve(robot, forward_kinematics(robot, q), lower)
+        assert np.all(np.isfinite(result.q))
+
+
+def test_transpose_step_is_zero_when_the_error_is_outside_the_range() -> None:
+    """A task error the Jacobian cannot see produces no step at all."""
+    jacobian = np.zeros((6, 6), dtype=np.float64)
+    twist = np.ones(6, dtype=np.float64)
+    assert np.allclose(transpose_step(jacobian, twist), np.zeros(6), atol=0.0)
+
+
+def test_variable_damping_switches_on_only_inside_the_singular_region() -> None:
+    """Damping is zero away from a singularity and reaches its maximum at one."""
+    robot = puma560()
+    regular = geometric_jacobian(robot, np.array([0.3, -0.9, 0.6, 0.4, 0.6, 0.2]))
+    singular = geometric_jacobian(robot, np.array([0.3, -0.9, 0.6, 0.4, 0.0, 0.2]))
+    assert variable_damping(regular, damping=0.05, epsilon=0.05) == 0.0
+    assert variable_damping(singular, damping=0.05, epsilon=0.05) == pytest.approx(0.05)
+
+
+def test_residual_damping_falls_to_the_bias_as_the_error_vanishes() -> None:
+    """``lambda^2`` is the squared error plus the bias, so it never reaches zero."""
+    assert residual_damping(np.zeros(6), bias=1e-8) == pytest.approx(1e-4)
+    assert residual_damping(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.3]), bias=0.0) == pytest.approx(
+        0.3
+    )
+
+
+def test_each_damping_schedule_picks_the_factor_it_documents() -> None:
+    """The three schedules return the fixed, the Chiaverini and the Sugihara value."""
+    robot = puma560()
+    jacobian = geometric_jacobian(robot, np.array([0.3, -0.9, 0.6, 0.4, 0.0, 0.2]))
+    error = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    fixed = DampedLeastSquaresIK(schedule=DampingSchedule.FIXED, damping=0.07)
+    region = DampedLeastSquaresIK(schedule=DampingSchedule.SINGULAR_REGION, damping=0.07)
+    marquardt = DampedLeastSquaresIK(schedule=DampingSchedule.LEVENBERG_MARQUARDT, bias=1e-8)
+
+    assert fixed.damping_for(jacobian, error) == pytest.approx(0.07)
+    assert region.damping_for(jacobian, error) == pytest.approx(
+        variable_damping(jacobian, damping=0.07, epsilon=region.epsilon)
+    )
+    assert marquardt.damping_for(jacobian, error) == pytest.approx(
+        residual_damping(error, bias=1e-8)
+    )
+
+
+def test_damped_solver_rejects_settings_it_cannot_honour() -> None:
+    """Each damping parameter is validated where it is declared."""
+    with pytest.raises(ValueError, match="damping must not be negative"):
+        DampedLeastSquaresIK(damping=-0.1)
+    with pytest.raises(ValueError, match="epsilon must be positive"):
+        DampedLeastSquaresIK(epsilon=0.0)
+    with pytest.raises(ValueError, match="bias must be positive"):
+        DampedLeastSquaresIK(bias=0.0)
+
+
+def test_solver_rejects_a_negative_iteration_budget() -> None:
+    """A negative budget is refused rather than silently treated as zero."""
+    robot = puma560()
+    solver = PseudoinverseIK(settings=SolverSettings(max_iterations=-1))
+    with pytest.raises(ValueError, match="max_iterations"):
+        solver.solve(robot, forward_kinematics(robot, robot.home()), robot.home())
+
+
+def test_solver_stops_when_the_step_stops_being_finite() -> None:
+    """A target carrying a non-finite entry ends the search with a stated reason."""
+    robot = puma560()
+    target = forward_kinematics(robot, np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1]))
+    target[0, 3] = np.nan
+    result = numerical_solvers(max_iterations=20)[1].solve(robot, target, robot.home())
+    assert not result.converged
+    assert result.message == "step became non-finite"
+    assert result.iterations == 0
+
+
+def test_solver_reports_convergence_reached_on_the_last_permitted_step() -> None:
+    """Meeting the tolerance exactly as the budget runs out still counts as converged."""
+    robot = puma560()
+    q = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
+    settings = SolverSettings(max_iterations=1, tolerance=Tolerance(1e-6, 1e-6))
+    result = PseudoinverseIK(settings=settings).solve(robot, forward_kinematics(robot, q), q + 1e-4)
+    assert result.iterations == 1
+    assert result.converged
+    assert result.message == "converged"
+
+
+def test_a_solver_ignoring_the_limits_leaves_the_box() -> None:
+    """Clearing ``respect_limits`` is the documented way to solve without a box."""
+    robot = puma560()
+    q = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
+    settings = SolverSettings(max_iterations=60, respect_limits=False)
+    result = PseudoinverseIK(settings=settings).solve(
+        robot, forward_kinematics(robot, q), q + 0.2
+    )
+    assert result.converged
+
+
+# --------------------------------------------------------------------------
+# The joint limit box as a constraint rather than a clip
+# --------------------------------------------------------------------------
+
+
+def _cornered(robot: Robot) -> np.ndarray:
+    """Return a configuration sitting on the lower bound of every joint."""
+    return np.array([limit.lower for limit in robot.limits], dtype=np.float64)
+
+
+def test_blocked_joints_names_only_the_bounds_being_pushed_through() -> None:
+    """A joint on a bound moving outward is blocked; moving inward it is not."""
+    limits = (JointLimit(-1.0, 1.0), JointLimit(-1.0, 1.0), JointLimit(-1.0, 1.0))
+    q = np.array([-1.0, 1.0, 0.0], dtype=np.float64)
+    delta = np.array([-0.5, 0.5, -0.5], dtype=np.float64)
+    assert blocked_joints(q, delta, limits).tolist() == [True, True, False]
+    assert blocked_joints(q, -delta, limits).tolist() == [False, False, False]
+
+
+def test_the_constrained_step_zeroes_exactly_the_joints_it_holds() -> None:
+    """Held components are exactly zero and free components are not clipped."""
+    robot = puma560()
+    q = _cornered(robot)
+    jacobian = geometric_jacobian(robot, q)
+    twist = np.array([0.0, 0.0, -0.4, 0.0, 0.0, 0.0], dtype=np.float64)
+    delta = active_set_step(pseudoinverse_step, jacobian, twist, q, robot.limits)
+    held = delta == 0.0
+    assert bool(held.any()), "this configuration was chosen because a bound binds"
+    assert np.all(clamp_to_limits(q + delta, robot.limits) == q + delta)
+
+
+def test_the_constrained_step_matches_the_plain_step_away_from_every_bound() -> None:
+    """With no bound active the active set changes nothing at all."""
+    robot = puma560()
+    q = np.array([0.3, -0.9, 0.6, 0.4, 0.5, 0.2], dtype=np.float64)
+    jacobian = geometric_jacobian(robot, q)
+    twist = np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    assert np.allclose(
+        active_set_step(pseudoinverse_step, jacobian, twist, q, robot.limits),
+        pseudoinverse_step(jacobian, twist),
+        atol=1e-15,
+    )
+
+
+def test_the_constrained_step_serves_the_task_better_than_clipping_does() -> None:
+    """On the linear model, the held solve beats clipping the unconstrained one."""
+    robot = puma560()
+    q = _cornered(robot)
+    jacobian = geometric_jacobian(robot, q)
+    twist = np.array([0.05, -0.05, 0.05, 0.1, -0.1, 0.1], dtype=np.float64)
+
+    plain = pseudoinverse_step(jacobian, twist)
+    clipped = clamp_to_limits(q + plain, robot.limits) - q
+    constrained = active_set_step(pseudoinverse_step, jacobian, twist, q, robot.limits)
+
+    clipped_miss = float(np.linalg.norm(jacobian @ clipped - twist))
+    constrained_miss = float(np.linalg.norm(jacobian @ constrained - twist))
+    assert constrained_miss < clipped_miss
+
+
+def test_the_constrained_step_is_zero_when_no_joint_may_move() -> None:
+    """A corner that blocks every joint yields no step rather than an illegal one."""
+    limits = (JointLimit(-1.0, 1.0), JointLimit(-1.0, 1.0))
+    q = np.array([-1.0, -1.0], dtype=np.float64)
+    jacobian = -np.ones((6, 2), dtype=np.float64)
+    twist = np.ones(6, dtype=np.float64)
+    delta = active_set_step(pseudoinverse_step, jacobian, twist, q, limits)
+    assert np.allclose(delta, np.zeros(2), atol=0.0)
+
+
+def test_the_active_set_solves_more_targets_than_clipping_alone(
+    rng: np.random.Generator,
+) -> None:
+    """The constrained step is a strict improvement on the recorded campaign."""
+    from manipulator_kinematics.pipeline import perturbed_seeds, sample_targets
+
+    robot = puma560()
+    targets = sample_targets(robot, 60, rng, margin=0.15)
+    seeds = perturbed_seeds(robot, targets, rng, spread=0.4)
+    tolerance = Tolerance(position=1e-6, orientation=1e-6)
+
+    def solved(active: bool) -> int:
+        solver = PseudoinverseIK(
+            settings=SolverSettings(
+                max_iterations=200,
+                tolerance=tolerance,
+                active_set=active,
+                backtracking=6 if active else 0,
+            )
+        )
+        return sum(
+            solver.solve(robot, target.pose, seed).converged
+            for target, seed in zip(targets, seeds, strict=True)
+        )
+
+    assert solved(True) > solved(False)
+
+
+def test_no_run_ends_worse_than_it_started(rng: np.random.Generator) -> None:
+    """The recorded trajectory never finishes above the residual it began with.
+
+    This assertion was tried while the limits were enforced by clipping alone,
+    and it failed: a clipped minimum-norm step is not a descent direction, so the
+    pseudoinverse ended above its starting residual on nine of two hundred PUMA
+    560 targets, by as much as a factor of ten. It holds now, which is the
+    property the constrained step was added to obtain.
+    """
+    from manipulator_kinematics.pipeline import perturbed_seeds, sample_targets
+
+    for robot in (puma560(), ur5()):
+        targets = sample_targets(robot, 25, rng, margin=0.15)
+        seeds = perturbed_seeds(robot, targets, rng, spread=0.4)
+        for solver in numerical_solvers(max_iterations=200):
+            for target, seed in zip(targets, seeds, strict=True):
+                result = solver.solve(robot, target.pose, seed)
+                assert result.residuals[-1] <= result.residuals[0], (
+                    f"{robot.name}/{solver.name} target {target.index}"
+                )
+
+
+# --------------------------------------------------------------------------
+# Declared data is validated where it is declared
+# --------------------------------------------------------------------------
+
+
+def test_a_joint_limit_must_be_finite_and_ordered() -> None:
+    """An unbounded or inverted range is refused at construction."""
+    with pytest.raises(ValueError, match="finite"):
+        JointLimit(-np.inf, 1.0)
+    with pytest.raises(ValueError, match="exceeds upper limit"):
+        JointLimit(1.0, -1.0)
+
+
+def test_a_joint_limit_reports_its_centre_and_width() -> None:
+    """Midpoint and span are the two derived numbers the sampler needs."""
+    limit = JointLimit(-0.5, 1.5)
+    assert limit.midpoint == pytest.approx(0.5)
+    assert limit.span == pytest.approx(2.0)
+
+
+def test_a_robot_needs_links_and_four_by_four_frames() -> None:
+    """An empty chain or a malformed base or tool transform is refused."""
+    link = DHParameter(d=0.0, theta=0.0, a=0.1, alpha=0.0)
+    with pytest.raises(ValueError, match="at least one link"):
+        Robot(name="empty", links=())
+    with pytest.raises(ValueError, match="4x4"):
+        Robot(name="bad-base", links=(link,), base=np.eye(3, dtype=np.float64))
+    with pytest.raises(ValueError, match="4x4"):
+        Robot(name="bad-tool", links=(link,), tool=np.eye(3, dtype=np.float64))
+
+
+def test_asking_for_limits_a_chain_never_declared_names_the_joints() -> None:
+    """A chain without limits reports which joints are missing them."""
+    links = (
+        DHParameter(d=0.0, theta=0.0, a=0.1, alpha=0.0, limit=JointLimit(-1.0, 1.0)),
+        DHParameter(d=0.0, theta=0.0, a=0.1, alpha=0.0),
+    )
+    robot = Robot(name="partial", links=links)
+    assert not robot.has_limits
+    with pytest.raises(ValueError, match=r"joints \[1\] have no declared limit"):
+        _ = robot.limits
+
+
+def test_a_tolerance_must_be_positive() -> None:
+    """A zero tolerance would be met by nothing, so it is refused."""
+    with pytest.raises(ValueError, match="tolerances must be positive"):
+        Tolerance(position=0.0, orientation=1e-6)
+    with pytest.raises(ValueError, match="tolerances must be positive"):
+        Tolerance(position=1e-6, orientation=-1.0)
+
+
+def test_identity_pose_is_the_neutral_element() -> None:
+    """Composing with the identity pose changes nothing."""
+    robot = puma560()
+    pose = forward_kinematics(robot, np.full(6, 0.3))
+    assert np.allclose(identity_pose() @ pose, pose, atol=0.0)
+    assert np.allclose(pose @ identity_pose(), pose, atol=0.0)
+
+
+def test_is_rotation_rejects_a_matrix_of_the_wrong_shape() -> None:
+    """A 4x4 pose is not a rotation matrix, whatever its upper block contains."""
+    assert not is_rotation(np.eye(4, dtype=np.float64))
+    assert not is_rotation(2.0 * np.eye(3, dtype=np.float64))
+    assert is_rotation(rotz(0.3) @ rotx(0.4))

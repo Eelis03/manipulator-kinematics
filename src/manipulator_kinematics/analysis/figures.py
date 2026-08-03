@@ -14,6 +14,7 @@ series carries a legend, so identity is never signalled by colour alone.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -25,7 +26,14 @@ from matplotlib.figure import Figure
 from manipulator_kinematics.analysis.metrics import SolverSummary
 from manipulator_kinematics.pipeline.trace import SingularityScan, Trace
 
-__all__ = ["PALETTE", "convergence_figure", "save_figure", "singularity_figure", "success_figure"]
+__all__ = [
+    "PALETTE",
+    "convergence_figure",
+    "residual_tail_figure",
+    "save_figure",
+    "singularity_figure",
+    "success_figure",
+]
 
 PALETTE: Final[tuple[str, ...]] = ("#0072b2", "#d55e00", "#009e73", "#7b4fa8")
 
@@ -196,6 +204,71 @@ def success_figure(summaries: tuple[SolverSummary, ...], *, robot: str) -> Figur
         ylabel="",
     )
     axes.grid(axis="y", visible=False)
+    figure.tight_layout()
+    return figure
+
+
+def residual_tail_figure(labelled: Sequence[tuple[str, Trace]], *, solver: str) -> Figure:
+    """Plot the sorted final residual of one solver across several campaigns.
+
+    A success count says how many targets a solver reached. It cannot say how
+    badly it missed the rest, and a median hides the tail by construction. Sorting
+    the final residual of every target and drawing it on a logarithmic axis shows
+    the whole distribution: where it crosses the tolerance, how many targets lie
+    beyond it, and how far beyond they lie.
+
+    Args:
+        labelled: One ``(label, trace)`` pair per campaign being compared. Every
+            trace must contain ``solver`` and cover the same targets.
+        solver: Which solver of each trace to draw.
+
+    Returns:
+        A single-axes figure.
+
+    Raises:
+        ValueError: If ``labelled`` is empty or a trace has no such solver.
+    """
+    if not labelled:
+        raise ValueError("at least one labelled trace is needed")
+
+    figure = Figure(figsize=(7.2, 4.0))
+    axes = figure.add_subplot(111)
+
+    tolerance = labelled[0][1].tolerance.position
+    for index, (label, trace) in enumerate(labelled):
+        trials = trace.for_solver(solver)
+        if not trials:
+            raise ValueError(f"trace {trace.robot!r} holds no trials for solver {solver!r}")
+        residuals = np.sort(
+            np.maximum([trial.result.final_residual for trial in trials], 1e-16)
+        )
+        missed = sum(not trial.result.converged for trial in trials)
+        axes.plot(
+            np.arange(1, residuals.size + 1),
+            residuals,
+            color=_colour(index),
+            linewidth=_LINE_WIDTH,
+            label=f"{label}, {missed} of {residuals.size} unsolved",
+        )
+
+    axes.axhline(tolerance, color=_MUTED, linewidth=1.0, linestyle="--")
+    axes.annotate(
+        "position tolerance",
+        xy=(0.01, tolerance),
+        xycoords=("axes fraction", "data"),
+        ha="left",
+        va="bottom",
+        color=_MUTED,
+        fontsize=8,
+    )
+    axes.set_yscale("log")
+    _style(
+        axes,
+        title=f"Residual of the returned configuration, {solver} on {labelled[0][1].robot}",
+        xlabel="target, ordered by residual",
+        ylabel="pose error norm at the answer (m and rad combined)",
+    )
+    axes.legend(frameon=False, fontsize=9, labelcolor=_INK, loc="upper left")
     figure.tight_layout()
     return figure
 

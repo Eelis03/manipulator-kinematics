@@ -51,7 +51,7 @@ from manipulator_kinematics.algorithm.forward import forward_kinematics
 from manipulator_kinematics.algorithm.jacobian import geometric_jacobian
 from manipulator_kinematics.algorithm.protocol import IKResult, Tolerance
 from manipulator_kinematics.model.dh import Robot
-from manipulator_kinematics.model.joints import clamp_to_limits
+from manipulator_kinematics.model.joints import JointLimit, clamp_to_limits, limit_span
 from manipulator_kinematics.model.transforms import pose_error
 
 __all__ = [
@@ -60,6 +60,8 @@ __all__ = [
     "JacobianTransposeIK",
     "PseudoinverseIK",
     "SolverSettings",
+    "active_set_step",
+    "blocked_joints",
     "damped_step",
     "numerical_solvers",
     "pseudoinverse_step",
@@ -69,8 +71,10 @@ __all__ = [
 ]
 
 Array = NDArray[np.float64]
+Mask = NDArray[np.bool_]
 
 _STEP_FLOOR = 1e-14
+_BOUND_TOLERANCE = 1e-12
 
 
 def _clamp_norm(vector: Array, limit: float) -> Array:
@@ -122,14 +126,24 @@ def pseudoinverse_step(jacobian: Array, twist: Array, *, rcond: float = 1e-12) -
 def damped_step(jacobian: Array, twist: Array, damping: float) -> Array:
     """Return ``J^T (J J^T + lambda^2 I)^-1 e``.
 
+    Zero damping is answered with :func:`pseudoinverse_step`, which is the limit
+    of this expression as ``lambda`` falls to zero and is defined whether or not
+    ``J J^T`` is invertible. Taking the formula literally there would ask for the
+    inverse of a matrix that is singular whenever the Jacobian has fewer than six
+    independent columns, which happens routinely once the active set holds a
+    joint at a bound.
+
     Args:
         jacobian: A 6 by n Jacobian.
         twist: The 6-vector task-space error or velocity to serve.
         damping: The damping factor ``lambda``.
 
     Returns:
-        The regularised joint-space step, bounded by ``||e|| / (2 lambda)``.
+        The regularised joint-space step, bounded by ``||e|| / (2 lambda)`` for
+        positive ``lambda`` and unbounded without it.
     """
+    if damping <= 0.0:
+        return pseudoinverse_step(jacobian, twist)
     rows = jacobian.shape[0]
     gram = jacobian @ jacobian.T + (damping**2) * np.eye(rows, dtype=np.float64)
     result: Array = jacobian.T @ solve(gram, twist, assume_a="pos")
@@ -172,15 +186,180 @@ def variable_damping(jacobian: Array, *, damping: float, epsilon: float) -> floa
     return damping * float(np.sqrt(1.0 - (smallest / epsilon) ** 2))
 
 
+def blocked_joints(
+    q: Array,
+    delta: Array,
+    limits: tuple[JointLimit, ...],
+    *,
+    tolerance: float = _BOUND_TOLERANCE,
+) -> Mask:
+    """Return the joints whose proposed motion is refused by an active bound.
+
+    A joint is blocked when it already sits on a limit, up to ``tolerance``, and
+    the proposed step would push it further outside. A joint merely heading
+    towards a limit is not blocked, because the step may be short enough to stay
+    inside.
+
+    Args:
+        q: The current configuration.
+        delta: The proposed joint step.
+        limits: Travel range of each joint.
+        tolerance: How close to a bound counts as sitting on it.
+
+    Returns:
+        A boolean mask with one entry per joint.
+    """
+    lower, upper = limit_span(limits)
+    at_lower = (q <= lower + tolerance) & (delta < 0.0)
+    at_upper = (q >= upper - tolerance) & (delta > 0.0)
+    blocked: Mask = at_lower | at_upper
+    return blocked
+
+
+def active_set_step(
+    step: Callable[[Array, Array], Array],
+    jacobian: Array,
+    twist: Array,
+    q: Array,
+    limits: tuple[JointLimit, ...],
+    *,
+    tolerance: float = _BOUND_TOLERANCE,
+) -> Array:
+    """Return the update rule ``step`` solved subject to the joint limit box.
+
+    Clipping a step back into the limit box does not generally leave a descent
+    direction, so an iterate that reaches a bound can sit against it while the
+    rule keeps asking for motion the joint cannot make. This is the classical
+    active-set treatment of a box-constrained least-squares step, in the form
+    described by C. L. Lawson and R. J. Hanson, *Solving Least Squares Problems*,
+    Prentice-Hall 1974, chapter 23. Two moves alternate:
+
+    Bind
+        Every joint sitting on a bound whose proposed motion leaves the box is
+        added to the active set, held at zero, and the same rule is solved again
+        on the remaining columns of the Jacobian. The solver then spends the
+        freedom it still has rather than the freedom it has lost.
+
+    Release
+        At the reduced solution the free components of ``J^T r`` vanish, and the
+        component belonging to a held joint is its Karush-Kuhn-Tucker multiplier.
+        A sign that points back into the box means holding that joint is what is
+        preventing progress, so the single worst offender is released. Releasing
+        one at a time is the standard guard against cycling between two sets.
+
+    The loop is capped at ``2 n`` passes, so it terminates whatever the geometry,
+    and every pass is the same rule on a narrower Jacobian, which is why the
+    constrained step costs no new dependency.
+
+    Args:
+        step: The update rule, taking a Jacobian and a task-space error.
+        jacobian: The full 6 by n Jacobian at ``q``.
+        twist: The task-space error the step is being asked to serve.
+        q: The current configuration, assumed to lie inside ``limits``.
+        limits: Travel range of each joint.
+        tolerance: How close to a bound counts as sitting on it.
+
+    Returns:
+        A joint step whose held components are exactly zero.
+    """
+    lower, upper = limit_span(limits)
+    on_lower = q <= lower + tolerance
+    on_upper = q >= upper - tolerance
+
+    size = jacobian.shape[1]
+    held = np.zeros(size, dtype=np.bool_)
+    delta = step(jacobian, twist)
+
+    for _ in range(2 * size):
+        binding = blocked_joints(q, delta, limits, tolerance=tolerance) & ~held
+        if bool(binding.any()):
+            held |= binding
+        else:
+            multiplier = jacobian.T @ (twist - jacobian @ delta)
+            escaping = held & ((on_lower & (multiplier > 0.0)) | (on_upper & (multiplier < 0.0)))
+            if not bool(escaping.any()):
+                break
+            worst = int(np.argmax(np.where(escaping, np.abs(multiplier), -np.inf)))
+            held[worst] = False
+
+        free = ~held
+        delta = np.zeros(size, dtype=np.float64)
+        if not bool(free.any()):
+            break
+        delta[free] = step(jacobian[:, free], twist)
+
+    delta[held] = 0.0
+    return delta
+
+
 @dataclass(frozen=True, slots=True)
 class SolverSettings:
-    """Loop parameters shared by every iterative solver."""
+    """Loop parameters shared by every iterative solver.
+
+    Attributes:
+        max_iterations: Iteration budget.
+        tolerance: Convergence thresholds on the two halves of the pose error.
+        max_step: Largest joint step norm accepted in one iteration.
+        error_clamp: Largest task-space error norm the step rule is shown, which
+            keeps the linear model inside the region where it is a description of
+            the problem.
+        respect_limits: Whether to hold the iterate inside the joint limits.
+        active_set: Whether a step refused by a bound is re-solved over the
+            joints that can still move. Has no effect when ``respect_limits`` is
+            cleared or the chain declares no limits.
+        backtracking: How many halvings of a step that failed to reduce the
+            residual are tried before the full step is taken anyway. Zero
+            disables the search.
+    """
 
     max_iterations: int = 200
     tolerance: Tolerance = field(default_factory=Tolerance)
     max_step: float = 1.0
     error_clamp: float = 0.5
     respect_limits: bool = True
+    active_set: bool = True
+    backtracking: int = 6
+
+
+def _advance(
+    robot: Robot,
+    target: Array,
+    q: Array,
+    delta: Array,
+    limits: tuple[JointLimit, ...] | None,
+    residual: float,
+    backtracking: int,
+) -> tuple[Array, Array]:
+    """Move along the projection of the ray ``q + t delta`` into the limit box.
+
+    Clipping bends the ray into an arc, and the arc is not guaranteed to descend
+    even when the ray does. The full step is taken whenever it improves on
+    ``residual``, which is the common case and costs nothing extra. Otherwise the
+    step is halved up to ``backtracking`` times, and the first length that does
+    improve is taken. If none does, the full step is taken anyway, so the loop
+    keeps the freedom to move through a worse configuration rather than stalling.
+
+    Returns:
+        The configuration reached and the pose error there.
+    """
+
+    def at(scale: float) -> tuple[Array, Array]:
+        candidate = q + scale * delta
+        if limits is not None:
+            candidate = clamp_to_limits(candidate, limits)
+        return candidate, pose_error(forward_kinematics(robot, candidate), target)
+
+    full = at(1.0)
+    if backtracking <= 0 or float(np.linalg.norm(full[1])) < residual:
+        return full
+
+    scale = 1.0
+    for _ in range(backtracking):
+        scale *= 0.5
+        shorter = at(scale)
+        if float(np.linalg.norm(shorter[1])) < residual:
+            return shorter
+    return full
 
 
 def _iterate(
@@ -211,7 +390,11 @@ def _iterate(
             message = "converged"
             break
         jacobian = geometric_jacobian(robot, q)
-        delta = step(jacobian, _clamp_norm(error, settings.error_clamp))
+        served = _clamp_norm(error, settings.error_clamp)
+        if limits is not None and settings.active_set:
+            delta = active_set_step(step, jacobian, served, q, limits)
+        else:
+            delta = step(jacobian, served)
         if not np.all(np.isfinite(delta)):
             message = "step became non-finite"
             break
@@ -220,10 +403,9 @@ def _iterate(
             message = "step size collapsed"
             break
 
-        q = q + delta
-        if limits is not None:
-            q = clamp_to_limits(q, limits)
-        error = pose_error(forward_kinematics(robot, q), target)
+        q, error = _advance(
+            robot, target, q, delta, limits, residuals[-1], settings.backtracking
+        )
         iterations += 1
         residual = float(np.linalg.norm(error))
         residuals.append(residual)

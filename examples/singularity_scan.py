@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("outputs"),
         help="directory the figure is written to",
     )
+    parser.add_argument("--dpi", type=int, default=150, help="resolution of the saved figure")
     args = parser.parse_args(argv)
 
     robot = puma560()
@@ -71,7 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"ratio of the peak steps      : {pseudoinverse.max() / damped.max():.3f}")
     print(f"largest per-point step ratio : {(pseudoinverse / damped).max():.3f}")
 
-    path = save_figure(singularity_figure(scan), args.output_dir / "puma560_singularity.png")
+    path = save_figure(
+        singularity_figure(scan), args.output_dir / "puma560_singularity.png", dpi=args.dpi
+    )
     print(f"figure written to {path.resolve()}")
     return 0
 

@@ -54,6 +54,69 @@ verified by running it back through forward kinematics before it is returned, an
 the residual is carried on the solution. A caller never has to trust the
 derivation on the strength of the derivation alone.
 
+### The joint limit box is a constraint on the step, not a clip afterwards
+
+Every iterative solver is asked for a configuration inside the declared joint
+limits. The first implementation obtained one the cheapest way available: take
+the unconstrained step, add it, and clip the result back into the box. That is
+correct by construction and it was wrong as a method, for the reason recorded in
+the limitation this section replaces. A clipped minimum-norm step is not
+generally a descent direction, so an iterate that reached a bound could sit
+against it while the rule kept asking for motion the joint could not make.
+
+The step is now solved subject to the box, by the classical active-set treatment
+of a box-constrained least-squares problem (Lawson and Hanson 1974, chapter 23).
+Two moves alternate. A joint sitting on a bound whose proposed motion leaves the
+box joins the active set: it is held at zero and the same update rule is solved
+again on the remaining columns of the Jacobian. At the reduced solution the
+component of
+`J^T r` belonging to a held joint is its Karush-Kuhn-Tucker multiplier, and a
+sign pointing back into the box means holding that joint is what is preventing
+progress, so the single worst offender is released. Releasing one at a time is
+the standard guard against cycling, and the pass count is capped at twice the
+joint count so the routine terminates whatever the geometry.
+
+A second guard sits underneath it. Clipping bends the ray `q + t dq` into an arc,
+and the arc can climb even where the ray descends, so a step that fails to reduce
+the residual is halved up to six times and the first length that does reduce it
+is taken. The full step is taken when none does, which keeps the freedom to pass
+through a worse configuration rather than stalling there.
+
+Both are on by default and both are separately selectable, because the ablation
+is the evidence. Over the 200 PUMA 560 and 200 UR5 targets of the results table:
+
+```bash
+uv run python examples/compare_ik_solvers.py --limit-strategy clip --backtracking 0
+uv run python examples/compare_ik_solvers.py --limit-strategy active-set --backtracking 0
+uv run python examples/compare_ik_solvers.py --limit-strategy clip --backtracking 6
+uv run python examples/compare_ik_solvers.py --limit-strategy active-set --backtracking 6
+```
+
+| strategy | line search | PUMA 560 solved | UR5 solved |
+| --- | --- | --- | --- |
+| clip | no | 179/200 | 195/200 |
+| clip | yes | 181/200 | 196/200 |
+| active set | no | 189/200 | 196/200 |
+| active set | yes | 191/200 | 197/200 |
+
+Only the pseudoinverse row moves. The Jacobian transpose is unchanged at 40/200
+and 26/200 because its steps are far too short to reach a bound in the first
+place, and damped least squares is unchanged at 200/200 and 200/200 because the
+residual-scaled damping already keeps it inside the box. That is the honest
+reading: the constrained step buys nothing for a method that was never blocked,
+and for the one that was it recovers 12 of 21 failures on the PUMA 560 and 2 of 5
+on the UR5.
+
+The cost is three things. The reduced solve runs at most twice per joint per
+iteration, which is bounded but not free, and the line search costs up to six
+extra forward kinematics evaluations on the iterations where a step fails. The
+loop gained two settings and three functions. And `damped_step` had to learn
+that zero damping means the pseudoinverse rather than the literal formula,
+because `J J^T` is singular the moment the active set removes a column, which
+made the Chiaverini schedule raise `LinAlgError` the first time it met a held
+joint. That defect existed only because the constrained step created the
+rank-deficient case, and it is now covered by a test.
+
 ### Residual-scaled damping as the default for the iterative solver
 
 Three damping schedules are implemented and the choice is explicit on the solver.
@@ -81,8 +144,8 @@ over the same 200 PUMA 560 targets gives
 | schedule | solved | median iterations | median position error (m) |
 | --- | --- | --- | --- |
 | fixed | 178/200 | 10 | 7.600e-07 |
-| singular-region | 177/200 | 5 | 2.887e-08 |
-| levenberg-marquardt | 200/200 | 6 | 1.137e-09 |
+| singular-region | 177/200 | 5 | 2.931e-08 |
+| levenberg-marquardt | 200/200 | 6 | 1.219e-09 |
 
 All three bound the step near a singularity. Only the third reaches 1e-6 on every
 target, and it does so without paying for it in iterations. The singular-region
@@ -150,24 +213,24 @@ still solves the UR5 numerically, at 200 out of 200 with the default solver.
 
 ### The pseudoinverse as the default iterative solver
 
-The pseudoinverse converges quadratically and reached the tolerance in a median of
-five iterations, one fewer than damped least squares. It was not made the default
-because it failed 21 of 200 PUMA 560 targets and 5 of 200 UR5 targets, with
-residuals up to 2.8. The cause is the interaction with joint limits: an
-unconstrained minimum-norm step clipped back into the limit box is no longer a
-descent direction, and the iteration can sit against a bound indefinitely. The
-damped step is shortened rather than truncated, so it stays inside the box more
-often. One extra iteration for a 10 percent higher success rate is a clear trade.
+The pseudoinverse converges quadratically and reaches the tolerance in a median of
+five iterations, one fewer than damped least squares. It is not the default
+because it still fails 9 of 200 PUMA 560 targets and 3 of 200 UR5 targets even
+with the box-constrained step described above, while damped least squares solves
+every target on both arms. One extra iteration for the last five percent of the
+success rate is a clear trade.
 
 ### Null-space joint limit avoidance
 
-The proper treatment of joint limits is to project a limit-avoidance gradient into
-the null space of the Jacobian (Liegeois 1977), or to solve a constrained
-quadratic program at each step. Either would have removed the failure mode above
-entirely. Both were rejected as out of scope: the null-space term needs a
-secondary objective, a gain, and its own convergence analysis, and the quadratic
-program needs a solver that is not among the three permitted dependencies. The
-limitation is documented below and measured in the results rather than hidden.
+Liegeois 1977 projects a limit-avoidance gradient into the null space of the
+Jacobian, which is the standard treatment when the chain has joints to spare. It
+was considered and does not apply here. Both shipped six-joint arms are
+non-redundant, so `I - J^+ J` is the zero matrix wherever the Jacobian has full
+rank, and the null-space term is identically zero exactly where it would be
+needed. The active-set step was chosen instead because it works on a square
+Jacobian: it does not need spare freedom, only the freedom that remains after a
+bound has taken some away. The null-space term stays worth having for a
+seven-joint arm, which this library does not ship.
 
 ### An analytic Jacobian with a Euler-angle orientation error
 
@@ -199,15 +262,44 @@ joints, or a different twist pattern raise `StructureError`. Removing this would
 mean implementing the general degree-sixteen solution, or one closed form per arm
 family. The numerical solvers have no such restriction and are the fallback.
 
-### Joint limits are enforced by clipping
+### An iterate can stop at a constrained local minimum
 
-Every iterative solver clips its iterate back into the limit box after each step.
-This is the simplest correct-by-construction way to guarantee the returned
-configuration is feasible, and it is why the returned configuration always
-satisfies the limits. It is not a good descent strategy: the clipped step is not
-generally a descent direction, and it accounts for every pseudoinverse failure in
-the results table. Removing this limitation means a null-space limit-avoidance
-term, or a constrained quadratic program at each step.
+This entry replaces the one it grew out of. That entry read "joint limits are
+enforced by clipping", and said that a clipped step is not generally a descent
+direction and that this accounted for every pseudoinverse failure in the results
+table. The step is now solved subject to the limit box rather than clipped after
+the fact, by the active set described under method selection above, so the first
+half of that claim no longer holds. The second half turned out to be wrong, and
+what is left is the correct diagnosis.
+
+Run
+
+```bash
+uv run python examples/compare_ik_solvers.py --diagnose-failures
+```
+
+which lists every unsolved trial with the number of joints pressed against a
+bound and the conditioning at the answer. The 12 pseudoinverse failures, 9 on the
+PUMA 560 and 3 on the UR5, fall into two groups.
+
+Eight of them, 7 on the PUMA 560 and 1 on the UR5, stop with a joint on a bound at
+a Jacobian that is nowhere near singular: manipulability between 3.7336e-04 and
+8.2048e-03, condition number between 17.8 and 906. These are genuine
+Karush-Kuhn-Tucker points of the box-constrained problem. No feasible direction
+reduces the pose error to first order, the multiplier test agrees that no held
+joint wants to be released, and the step therefore collapses. The target is
+reachable, but not from that seed without leaving the box on the way.
+
+The other four, 2 on each arm, are the singular case rather than the constrained
+one: manipulability between 2.3758e-07 and 6.6887e-06 and condition number above
+2.0e+04, where the truncated pseudoinverse discards the direction it cannot serve.
+One of the four sits on a bound as well, which is a coincidence of that target
+rather than a cause.
+
+Escaping a constrained local minimum is a restart question, not a step question:
+a second seed, a homotopy in the target, or a global method. None of those is a
+better step rule, so none of them belongs in the update loop, and the library
+offers the damped solver instead, which solved every target on both arms.
 
 ### The orientation error is discontinuous at a half turn
 

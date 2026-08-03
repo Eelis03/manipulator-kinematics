@@ -30,7 +30,11 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run tests
-        run: uv run pytest -q
+        run: >-
+          uv run pytest -q
+          --cov=src/manipulator_kinematics
+          --cov-report=term-missing
+          --cov-fail-under=98
 
       - name: Lint
         run: uv run ruff check .

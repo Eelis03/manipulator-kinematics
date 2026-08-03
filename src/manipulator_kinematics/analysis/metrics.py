@@ -6,9 +6,16 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from manipulator_kinematics.model.joints import JointLimit, limit_span
 from manipulator_kinematics.pipeline.trace import SingularityScan, Trace
 
-__all__ = ["SolverSummary", "format_scan_table", "format_summary_table", "summarise"]
+__all__ = [
+    "SolverSummary",
+    "format_failure_table",
+    "format_scan_table",
+    "format_summary_table",
+    "summarise",
+]
 
 _COLUMNS: tuple[tuple[str, int], ...] = (
     ("solver", 22),
@@ -128,6 +135,54 @@ def format_summary_table(summaries: tuple[SolverSummary, ...]) -> str:
                 )
             )
         )
+    return "\n".join(lines)
+
+
+def format_failure_table(
+    trace: Trace,
+    limits: tuple[JointLimit, ...],
+    *,
+    tolerance: float = 1e-9,
+) -> str:
+    """Render every trial that did not converge, with the evidence for why.
+
+    A success count says how many targets were missed. This says what the misses
+    have in common: whether the answer is pressed against a joint limit, which
+    points at a constrained stationary point, or whether the Jacobian has lost
+    rank there, which points at a singularity instead. The two call for different
+    remedies and only one of them is a step rule.
+
+    Args:
+        trace: The campaign to inspect.
+        limits: Travel range of each joint, used to count active bounds.
+        tolerance: How close to a bound counts as sitting on it.
+
+    Returns:
+        A string with a header, a rule, and one line per failed trial, or a
+        single line saying that every trial converged.
+    """
+    lower, upper = limit_span(limits)
+    header = (
+        f"{'solver':>22}  {'target':>7}  {'residual':>11}  {'on bound':>9}  "
+        f"{'manip':>11}  {'cond':>11}  reason"
+    )
+    lines = [header, "-" * len(header)]
+    for trial in trace.trials:
+        if trial.result.converged:
+            continue
+        on_bound = int(
+            np.count_nonzero(
+                (trial.result.q <= lower + tolerance) | (trial.result.q >= upper - tolerance)
+            )
+        )
+        lines.append(
+            f"{trial.solver:>22}  {trial.target_index:7d}  "
+            f"{trial.result.final_residual:11.4e}  {on_bound:9d}  "
+            f"{trial.conditioning.manipulability:11.4e}  "
+            f"{trial.conditioning.condition_number:11.4e}  {trial.result.message}"
+        )
+    if len(lines) == 2:
+        return "every trial converged"
     return "\n".join(lines)
 
 

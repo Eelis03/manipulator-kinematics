@@ -1,4 +1,4 @@
-"""Tier two: regression against a recorded reference.
+"""Regression against a recorded reference.
 
 ``tests/data/reference.json`` pins the behaviour of the library on a fixed
 trajectory, a fixed set of analytic solutions, and a fixed inverse kinematics
@@ -40,17 +40,18 @@ machine.
 
 What is reproducible is which targets the solver converges on and how many
 iterations it takes. Those are pinned. For a non-converged trial the test asserts
-only that the result is finite and that the residual is still above the
-tolerance, so a solver cannot report failure on a trial it actually solved, or
-return a NaN and have it counted as a failure like any other.
+that the result is finite, that the residual is still above the tolerance, and
+that the trajectory did not end above the residual it started from, so a solver
+cannot report failure on a trial it actually solved, or return a NaN and have it
+counted as a failure like any other.
 
-A stronger assertion was tried and removed: that a non-converged run at least
-reduced its residual below the starting value. It does not hold, and the reason
-is a documented property of this library rather than a defect in the test. The
-pseudoinverse solver clips each step to the joint limits, and a clipped
-minimum-norm step is no longer a descent direction, so the residual can and does
-increase on some trials. Asserting progress would have encoded a false claim
-about the method. The limitation is recorded in the design notes.
+That last assertion has a history. It was written, it failed, and it was removed,
+because while the joint limits were enforced by clipping alone a clipped
+minimum-norm step was not a descent direction and the pseudoinverse ended above
+its starting residual on nine of two hundred PUMA 560 targets. Asserting progress
+would have encoded a false claim about the method, so the limitation was recorded
+in the design notes instead. The step is now solved subject to the limit box
+rather than clipped afterwards, the claim became true, and the assertion is back.
 """
 
 from __future__ import annotations
@@ -293,6 +294,8 @@ def test_campaign_matches_the_reference(reference: dict[str, Any]) -> None:
                 where = f"{label}: trial {index}"
                 assert np.isfinite(end), f"{where} returned a non-finite residual"
                 assert end > tolerance.position, f"{where} is flagged unconverged but met tolerance"
+                history = trial.result.residuals
+                assert history[-1] <= history[0], f"{where} ended above its starting residual"
 
 
 if __name__ == "__main__":  # pragma: no cover - regeneration entry point

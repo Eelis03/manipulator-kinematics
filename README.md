@@ -1,77 +1,129 @@
 # Manipulator Kinematics
 
-Forward and inverse kinematics for serial manipulators with Jacobian conditioning and singularity detection.
+Forward and inverse kinematics for serial manipulators, with Jacobian
+conditioning and singularity detection.
 
 [![CI](https://github.com/Eelis03/manipulator-kinematics/actions/workflows/ci.yml/badge.svg)](https://github.com/Eelis03/manipulator-kinematics/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Overview
+![Pose error against iteration for four inverse kinematics solvers on the PUMA 560 over 200 targets, with the Jacobian transpose crawling above the tolerance line for hundreds of iterations while the pseudoinverse and damped least squares drop below it within ten and the closed form reaches machine precision in one](docs/figures/puma560_convergence.png)
 
-This library computes where the tool of a serial manipulator is, given its joint
-values, and what joint values put the tool at a requested pose. It covers both
-Denavit-Hartenberg conventions, chains mixing revolute and prismatic joints, a
-closed-form solution for the 6R arm with a spherical wrist, three iterative
-solvers behind one interface, and the singular value metrics that say how close a
-configuration is to a singularity. It is aimed at anyone building or evaluating
-manipulator control software who needs a reference implementation they can read
-and check, rather than a black box.
+Four solvers, one target set, one figure. The closed form drops to 1e-16 in a
+single step. The pseudoinverse and damped least squares reach 1e-6 in under ten
+iterations. The Jacobian transpose reaches 1e-3 quickly and then crawls, and most
+of its trials are still above the tolerance line when the budget runs out. That
+shape is the reason this library exists: which method to use is not a matter of
+taste, and the difference is measurable.
 
-Three published parameter sets ship with the library: the Unimation PUMA 560, the
-Universal Robots UR5, and the Stanford manipulator. Each carries its source in a
-field on the model.
+## Defining a robot
 
-## Problem
+A robot is a Denavit-Hartenberg table, a convention, and optional joint limits.
+Three published parameter sets ship with the library, each carrying its citation
+on the model.
 
-A serial manipulator is a chain of rigid links. Forward kinematics is a
-composition of homogeneous transforms and is unambiguous. Inverse kinematics is
-not: the map from joint values to tool poses is nonlinear, many to one, and not
-onto, so a requested pose can have no solution, a finite set of solutions, or a
-continuum of them. The practical questions are therefore:
+```python
+import numpy as np
 
-1. Which arms admit a closed-form solution, and what exactly does that solution
-   assume about the geometry?
-2. For arms that do not, how should the linear system `J dq = e` be inverted at
-   each step, given that `J` loses rank at singular configurations where the
-   inverse does not exist and the pseudoinverse is unbounded in its neighbourhood?
-3. How is the distance to a singularity measured, given that the Jacobian of a
-   six-degree-of-freedom arm mixes rows with units of metres and rows with units
-   of radians, so its singular values are not directly comparable?
+from manipulator_kinematics import DHParameter, JointLimit, Robot, chain_reach, puma560
 
-This repository answers all three and measures the answers on two arms.
+robot = puma560(tool_offset=0.05625)
+print(robot.n_joints, robot.convention.value, f"reach {chain_reach(robot):.4f} m")
 
-## Approach
+scara = Robot(
+    name="scara",
+    links=(
+        DHParameter(d=0.30, theta=0.0, a=0.25, alpha=0.0, limit=JointLimit(-2.6, 2.6)),
+        DHParameter(d=0.00, theta=0.0, a=0.20, alpha=np.pi, limit=JointLimit(-2.4, 2.4)),
+    ),
+)
+print(scara.name, scara.n_joints, f"reach {chain_reach(scara):.4f} m")
+```
 
-Forward kinematics composes one 4x4 transform per link. Both the standard
-arrangement of Denavit and Hartenberg 1955, as tabulated by Paul 1981, and the
-modified arrangement of Craig 1986 are implemented, because published parameter
-tables use both and mixing them silently gives wrong answers. The convention is
-carried on the robot, not chosen globally, and the two are checked against each
-other in the test suite by building the same chain twice.
+```text
+6 standard reach 1.0902 m
+scara 2 reach 0.7500 m
+```
 
-Closed-form inverse kinematics uses kinematic decoupling, following Paul 1981 and
-Siciliano et al. 2009 section 2.12.2: when the last three axes intersect, the
-intersection point depends only on the first three joints, which splits the
-six-dimensional problem into a three-dimensional position problem with four
-postures and a three-dimensional orientation problem with two, giving eight
-solutions. The derivation is written for the PUMA 560 structure and the library
-checks that structure before using it, so an arm it was not derived for fails
-with a message naming the offending parameter rather than returning wrong angles.
+Both conventions are supported and the choice is a field on the `Robot`, not a
+global setting, because published tables use both and evaluating a Craig table
+under the Paul arrangement returns a valid pose that is silently wrong. Revolute
+and prismatic joints may be mixed in one chain; the shipped Stanford arm has one
+of each.
 
-Iterative inverse kinematics is implemented behind a `Protocol`, so the three
-methods are interchangeable and directly comparable: Jacobian transpose with the
-optimal step of Buss 2009, the Moore-Penrose pseudoinverse from a truncated
-singular value decomposition, and damped least squares with a choice of three
-damping schedules. The default schedule is the residual-scaled Levenberg-Marquardt
-rule of Sugihara 2011, chosen because it is the only one of the three that is both
-bounded at a singularity and able to reach a tight tolerance. Singularity metrics
-are the Yoshikawa manipulability index, the condition number, and the smallest
-singular value, all computed from a singular value decomposition of a Jacobian
-whose rotation rows have been divided by a characteristic length so the two blocks
-are dimensionally comparable.
+## Solving for a pose
 
-The alternatives that were considered and not chosen are recorded in
-[docs/design-notes.md](docs/design-notes.md).
+`analytic_ik` returns every closed-form branch for a 6R arm with a spherical
+wrist. The iterative solvers implement one `Protocol`, so they are
+interchangeable and directly comparable.
+
+```python
+from manipulator_kinematics import analytic_ik, forward_kinematics, numerical_solvers
+
+q = np.array([0.4, -1.1, 0.7, -0.5, 0.9, 0.3])
+target = forward_kinematics(robot, q)
+print(np.array2string(target[:3, 3], precision=6))
+
+branches = analytic_ik(robot, target)
+feasible = [branch for branch in branches if branch.feasible]
+print(f"{len(branches)} branches, {len(feasible)} inside the joint limits")
+print(f"{feasible[0].branch}: {feasible[0].position_error:.3e} m")
+
+damped = numerical_solvers(max_iterations=100)[2]
+result = damped.solve(robot, target, np.zeros(6))
+print(
+    f"{result.solver}: converged={result.converged} "
+    f"iterations={result.iterations} residual={result.final_residual:.3e}"
+)
+```
+
+```text
+[0.382443 0.02172  0.052249]
+8 branches, 2 inside the joint limits
+right/up/non-flip: 9.232e-17 m
+damped-least-squares: converged=True iterations=7 residual=1.101e-07
+```
+
+Every closed-form branch is verified by running it back through forward
+kinematics before it is returned, and the residual is carried on the solution, so
+a caller never has to trust the derivation on the strength of the derivation
+alone. An arm the derivation was not written for raises `StructureError` naming
+the offending parameter rather than returning wrong angles. Every iterative
+solver returns the best iterate it saw, always inside the joint limits, together
+with the residual history that drew the figure above.
+
+## Measuring distance to a singularity
+
+```python
+from manipulator_kinematics import conditioning, geometric_jacobian
+
+metrics = conditioning(geometric_jacobian(robot, q), characteristic_length=chain_reach(robot))
+print(f"manipulability    {metrics.manipulability:.6e}")
+print(f"condition number  {metrics.condition_number:.4f}")
+print(f"smallest sigma    {metrics.smallest_singular_value:.6e}")
+print(f"is_singular       {metrics.is_singular}")
+
+wrist_lock = q.copy()
+wrist_lock[4] = 0.0
+locked = conditioning(
+    geometric_jacobian(robot, wrist_lock), characteristic_length=chain_reach(robot)
+)
+print(f"at q5 = 0         {locked.manipulability:.6e}  {locked.is_singular}")
+```
+
+```text
+manipulability    3.430033e-02
+condition number  7.1951
+smallest sigma    2.281307e-01
+is_singular       False
+at q5 = 0         2.229981e-18  True
+```
+
+The `characteristic_length` is not optional decoration. The translation rows of a
+geometric Jacobian carry metres and the rotation rows do not, so without dividing
+the rotation rows by a length the condition number depends on whether the arm was
+measured in metres or millimetres. `chain_reach` is the length used everywhere
+here, following Angeles 2007 section 4.9.
 
 ## Installation
 
@@ -91,86 +143,33 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-## Usage
-
-```python
-import numpy as np
-
-from manipulator_kinematics import (
-    analytic_ik,
-    chain_reach,
-    conditioning,
-    forward_kinematics,
-    geometric_jacobian,
-    numerical_solvers,
-    puma560,
-)
-
-robot = puma560(tool_offset=0.05625)
-q = np.array([0.4, -1.1, 0.7, -0.5, 0.9, 0.3])
-target = forward_kinematics(robot, q)
-
-jacobian = geometric_jacobian(robot, q)
-metrics = conditioning(jacobian, characteristic_length=chain_reach(robot))
-print(f"manipulability {metrics.manipulability:.6e}")
-print(f"condition number {metrics.condition_number:.4f}")
-
-branches = analytic_ik(robot, target)
-worst = max(branch.position_error for branch in branches)
-print(f"closed-form branches {len(branches)}, worst error {worst:.3e} m")
-
-damped = numerical_solvers(max_iterations=100)[2]
-result = damped.solve(robot, target, np.zeros(6))
-print(f"{result.solver}: converged={result.converged} iterations={result.iterations}")
-```
-
-which prints
-
-```text
-manipulability 3.430033e-02
-condition number 7.1951
-closed-form branches 8, worst error 2.420e-16 m
-damped-least-squares: converged=True iterations=7
-```
-
-Runnable examples live in `examples/`:
-
-```bash
-uv run python examples/forward_kinematics_tour.py
-uv run python examples/analytic_ik_puma560.py
-uv run python examples/compare_ik_solvers.py
-uv run python examples/singularity_scan.py
-```
-
-Every script takes `--help`. The two that draw figures write them to `outputs/`
-by default, changeable with `--output-dir`.
+The package ships a `py.typed` marker, so an installing project gets the
+annotations rather than `Any`.
 
 ## Results
 
-All numbers below are the output of the commands shown. They were produced on
-Python 3.12 with NumPy 2.5.1 and SciPy 1.18.0.
+All numbers below are the output of the commands shown, on Python 3.12 with
+NumPy 2.5.1 and SciPy 1.18.0.
 
-### Solver comparison
+### Four solvers on the same 200 targets
 
-`uv run python examples/compare_ik_solvers.py`, which solves 200 targets per arm.
-Targets are generated by sampling configurations inside the joint limits with a
-15 percent margin and running them through forward kinematics, so every target is
-reachable. Seeds are the generating configuration displaced by a Gaussian with a
-standard deviation of 0.4 rad and clipped back into the limits. All solvers see
-the same targets and the same seeds. The budget is 500 iterations and the
-tolerance is 1e-6 m and 1e-6 rad on the two halves of the pose error. Damped least
-squares uses its default residual-scaled schedule; the other two schedules are
-selectable with `--damping-schedule` and are compared in the design notes. Median
-iteration counts are taken over converged trials only; median errors are taken
-over all trials.
+`uv run python examples/compare_ik_solvers.py`. Targets are generated by sampling
+configurations inside the joint limits with a 15 percent margin and running them
+through forward kinematics, so every target is reachable. Seeds are the
+generating configuration displaced by a Gaussian with a standard deviation of
+0.4 rad and clipped back into the limits. All solvers see the same targets and
+the same seeds. The budget is 500 iterations and the tolerance is 1e-6 m and
+1e-6 rad on the two halves of the pose error. Median iteration counts are taken
+over converged trials only; median errors over all trials; the worst residual is
+measured at the configuration actually returned.
 
 PUMA 560:
 
 | solver | solved | median iterations | median position error (m) | median orientation error (rad) | worst residual |
 | --- | --- | --- | --- | --- | --- |
 | jacobian-transpose | 40/200 | 310 | 4.713e-04 | 5.533e-05 | 1.775e-02 |
-| pseudoinverse | 179/200 | 5 | 1.850e-11 | 5.411e-09 | 2.796e+00 |
-| damped-least-squares | 200/200 | 6 | 1.137e-09 | 4.996e-09 | 1.228e-06 |
+| pseudoinverse | 191/200 | 5 | 2.301e-11 | 2.377e-09 | 5.666e-01 |
+| damped-least-squares | 200/200 | 6 | 1.219e-09 | 5.838e-09 | 1.156e-06 |
 | analytic | 200/200 | 1 | 1.360e-16 | 2.145e-16 | 5.890e-15 |
 
 UR5, which has no spherical wrist and therefore no analytic row:
@@ -178,28 +177,77 @@ UR5, which has no spherical wrist and therefore no analytic row:
 | solver | solved | median iterations | median position error (m) | median orientation error (rad) | worst residual |
 | --- | --- | --- | --- | --- | --- |
 | jacobian-transpose | 26/200 | 329 | 1.496e-03 | 1.828e-04 | 2.922e-02 |
-| pseudoinverse | 195/200 | 5 | 2.259e-09 | 1.161e-09 | 5.214e-01 |
-| damped-least-squares | 200/200 | 6 | 3.074e-09 | 1.149e-09 | 1.106e-06 |
+| pseudoinverse | 197/200 | 5 | 1.821e-09 | 5.277e-10 | 2.568e-02 |
+| damped-least-squares | 200/200 | 6 | 3.058e-09 | 8.913e-10 | 1.106e-06 |
 
-Three findings. First, the Jacobian transpose reaches 1e-3 quickly and then
-crawls, converging on 20 percent of PUMA 560 targets and 13 percent of UR5 targets
-within 500 iterations, which matches the linear convergence rate the method is
-known for. Second, the pseudoinverse and damped least squares are equally fast at
-a median of five and six iterations, but the pseudoinverse leaves 21 PUMA 560
-targets and 5 UR5 targets unsolved with residuals as large as 2.8, because
-clipping an unconstrained pseudoinverse step back into the joint limit box
-produces a direction that is no longer a descent direction. The residual-scaled
-damping shortens the step instead of truncating it, and solved every target on
-both arms. Third, the closed form is exact to floating point, and it uses its seed
-only to choose among the eight branches, never to find them.
+Three findings. The Jacobian transpose converges on 20 percent of PUMA 560
+targets and 13 percent of UR5 targets within 500 iterations, which is the linear
+convergence rate the method is known for behaving exactly as documented. The
+pseudoinverse and damped least squares are equally fast at a median of five and
+six iterations, but the pseudoinverse still misses 9 PUMA 560 and 3 UR5 targets,
+for reasons taken apart in the next section. The closed form is exact to floating
+point and uses its seed only to choose among the eight branches, never to find
+them.
 
-### Closed-form solution structure
+### The joint limit box, and what enforcing it properly bought
+
+![Sorted final residual of the pseudoinverse solver over 200 PUMA 560 targets under two joint limit strategies, showing the two curves indistinguishable below the tolerance line and the clipping curve breaking away into a tail of 21 failures where the active set curve holds to 191 targets before breaking into 9](docs/figures/puma560_limit_strategy.png)
+
+The iterate has to stay inside the joint limits. The obvious way to arrange that
+is to take the unconstrained step and clip the result back into the box, and it
+was how this library started. A clipped minimum-norm step is not generally a
+descent direction, so an iterate that reached a bound could sit against it while
+the rule kept asking for motion the joint could not make.
+
+The step is now solved subject to the box instead, by the active-set method of
+Lawson and Hanson 1974: a joint on a bound whose motion leaves the box is held at
+zero and the rule is solved again on the remaining columns of the Jacobian, and a
+held joint whose multiplier points back into the box is released. Underneath it,
+a step that fails to reduce the residual is halved up to six times before it is
+accepted anyway. Both are on by default and both can be turned off:
+
+```bash
+uv run python examples/compare_ik_solvers.py --limit-strategy clip --backtracking 0
+uv run python examples/compare_ik_solvers.py --limit-strategy active-set --backtracking 6
+```
+
+| strategy | line search | PUMA 560 solved | UR5 solved |
+| --- | --- | --- | --- |
+| clip | no | 179/200 | 195/200 |
+| clip | yes | 181/200 | 196/200 |
+| active set | no | 189/200 | 196/200 |
+| active set | yes | 191/200 | 197/200 |
+
+The figure is what the counts cannot show. Below the tolerance line the two
+curves lie on top of each other, so the constrained step costs nothing on the
+targets that were never blocked. Above it, clipping breaks away into a tail
+spanning six decades while the active set holds twelve more targets under the
+line, and the failures that remain fail by less.
+
+Only the pseudoinverse row moves in the table. The Jacobian transpose takes steps
+far too short to reach a bound, and damped least squares was already at 200/200
+on both arms. A separate consequence is that the recorded trajectory now never
+ends above the residual it started from, on any solver, on either arm. That
+assertion was written earlier, failed, and was deleted; it is back in
+`tests/test_regression.py` and in `tests/test_properties.py`.
+
+The nine PUMA 560 targets the pseudoinverse still misses are not the same kind of
+failure. `uv run python examples/compare_ik_solvers.py --diagnose-failures` shows
+that eight of the twelve remaining failures across both arms stop with a joint on
+a bound at a well conditioned Jacobian, manipulability between 3.7336e-04 and
+8.2048e-03: these are genuine constrained local minima, reachable targets that
+cannot be reached from that seed without leaving the box on the way. The other
+four stop near a singularity, below 6.6887e-06. Escaping a constrained local
+minimum is a restart question rather than a step question, and it is recorded as
+a limitation in [docs/design-notes.md](docs/design-notes.md) rather than papered
+over.
+
+### Eight closed-form branches, exact to round-off
 
 `uv run python examples/analytic_ik_puma560.py`, on the PUMA 560 with `d6` set to
-0.05625 m so the tool frame is separated from the wrist centre.
-
-For the target generated by `q = [0.4, -1.1, 0.7, -0.5, 0.9, 0.3]` rad, the solver
-returns all eight branches, two of which lie inside the published joint limits:
+0.05625 m so the tool frame is separated from the wrist centre. For the target
+generated by `q = [0.4, -1.1, 0.7, -0.5, 0.9, 0.3]` rad the solver returns all
+eight branches, two of which lie inside the published joint limits:
 
 ```text
                 branch  feasible   pos err (m)  rot err (rad)  q (rad)
@@ -214,12 +262,14 @@ returns all eight branches, two of which lie inside the published joint limits:
         left/down/flip     False    2.4197e-16     1.7893e-16  [ 2.7943 -2.0416  2.5355 -0.011  -1.067  -2.4997]
 ```
 
-Over 200 poses drawn inside the joint limits, the solver returned exactly eight
+Over 200 poses drawn inside the joint limits the solver returned exactly eight
 exact branches for every pose. The worst position error of the best branch was
 4.8660e-15 m and the worst orientation error 2.4441e-16 rad, both at the level of
 floating point round-off.
 
-### Singularity response
+### What a singularity does to each update rule
+
+![Three stacked panels sweeping the PUMA 560 wrist pitch through zero, showing manipulability and the smallest singular value collapsing to the floating point floor, the condition number spiking to 1e17, and the pseudoinverse step rising to 257 rad while the damped step stays under 3.8 rad and the Jacobian transpose step stays flat](docs/figures/puma560_singularity.png)
 
 `uv run python examples/singularity_scan.py`, sweeping the PUMA 560 wrist pitch
 `q5` from -0.3 rad to 0.3 rad in 401 steps about the configuration
@@ -236,14 +286,15 @@ same unit angular velocity about the world z axis.
 | ratio of the peak steps | 68.758 |
 | largest step ratio at a single point | 353.440 |
 
-Manipulability falls from 1.764e-02 at the ends of the sweep to the floating point
-floor at `q5 = 0`, and the condition number rises from 1.3e+01 to 2.7e+17, so
-either index locates the singularity. The pseudoinverse asks for a step of 257 rad
-just outside the singularity, while the damped rule with a maximum damping factor
-of 0.05 never exceeds 3.74 rad, a factor of 69 on the peaks. At the singularity
-itself the truncated pseudoinverse step collapses to 0.73 rad because the
-unreachable direction is discarded entirely, which is why the smallest singular
-value rather than the step magnitude is the reliable detector.
+Manipulability falls from 1.764e-02 at the ends of the sweep to the floating
+point floor at `q5 = 0`, and the condition number rises from 1.3e+01 to 2.7e+17,
+so either index locates the singularity. The pseudoinverse asks for a step of
+257 rad just outside the singularity while the damped rule with a maximum damping
+factor of 0.05 never exceeds 3.74 rad. The bottom panel also shows why the step
+magnitude is the wrong detector: at the singularity itself the truncated
+pseudoinverse step collapses to 0.73 rad, because the unreachable direction is
+discarded entirely, so the spike has a notch in it. The smallest singular value
+has no such notch.
 
 ### Consistency checks
 
@@ -251,74 +302,92 @@ value rather than the step magnitude is the reliable detector.
 Jacobian and a central finite difference of forward kinematics with a step of
 1e-6 agree to within 1.2e-10 across all three arms and all reported
 configurations. The PUMA 560 zero configuration places the tool at
-`(0.4521, -0.15005, 0.4318)` m, which is `(a2 + a3, -(d2 + d3), d4)` read straight
-off the parameter table, and it is singular with a manipulability of 3.795e-19.
+`(0.4521, -0.15005, 0.4318)` m, which is `(a2 + a3, -(d2 + d3), d4)` read
+straight off the parameter table, and it is singular with a manipulability of
+3.795e-19.
 
-## Architecture
+## Reproducing this page
 
-Five layers, each depending only on the ones above it in this table.
+Every number above comes from one of these commands.
+
+```bash
+uv run python examples/forward_kinematics_tour.py
+uv run python examples/analytic_ik_puma560.py
+uv run python examples/compare_ik_solvers.py
+uv run python examples/compare_ik_solvers.py --diagnose-failures
+uv run python examples/singularity_scan.py
+```
+
+Every script takes `--help`. `compare_ik_solvers.py` and `singularity_scan.py`
+draw as they go and write into `outputs/`, which is not tracked.
+
+The three figures on this page are tracked, under `docs/figures`. They are
+snapshots, regenerated by one command:
+
+```bash
+uv run python examples/publish_figures.py
+```
+
+which writes them at 88 dpi, the resolution chosen so the three together stay
+inside the 250 KB the repository budgets for tracked images. CI does not compare
+the committed files against freshly drawn ones, byte for byte or otherwise,
+because matplotlib output is not byte reproducible across platforms or across
+library versions. What CI does check is that every figure function still runs and
+still produces the artists it claims, which is what `tests/test_analysis.py`
+asserts.
+
+The checks:
+
+```bash
+uv run pytest --cov=src/manipulator_kinematics --cov-report=term-missing
+uv run ruff check .
+uv run mypy
+```
+
+134 tests in about 20 seconds, at 100 percent statement coverage of the package.
+CI runs the same command on Linux and Windows with `--cov-fail-under=98`.
+
+The suite is one file per layer, plus two that check the repository rather than
+the mathematics.
+
+| File | Tests | What it establishes |
+| --- | --- | --- |
+| `tests/test_properties.py` | 85 | Mathematical facts. Every transform is orthonormal with determinant one. The analytic Jacobian matches a central finite difference on all three arms. Forward kinematics composed with the closed-form inverse returns the original pose on every branch. The two DH conventions are checked against each other by building the same chain twice. The constrained step serves the linear model better than clipping does, solves more targets than clipping does, and never ends a run above where it began. |
+| `tests/test_pipeline.py` | 11 | Target generation, campaigns, and the joint sweep, in process rather than through a script, so a failure names the function. |
+| `tests/test_analysis.py` | 23 | Summaries against hand computations, and figures read as artist trees rather than pixels, because the artists are reproducible across platforms and the pixels are not. |
+| `tests/test_regression.py` | 5 | Recorded behaviour pinned against `tests/data/reference.json`: a 25-point trajectory to 1e-12, three eight-branch solution sets to 1e-9, and two 25-target campaigns by solved count, iteration count and returned configuration. Regenerated deliberately with `uv run python tests/test_regression.py`. |
+| `tests/test_integration.py` | 8 | Every script in `examples/` runs as a subprocess under reduced settings, exits zero, prints, and writes its promised figures into a temporary directory. One test fails if a new example is added without being listed. |
+| `tests/test_packaging.py` | 2 | The `py.typed` marker exists inside the package directory and the wheel is configured to ship it. |
+
+## Inside the package
+
+Five layers, each depending only on the ones above it.
 
 | Module | Responsibility |
 | --- | --- |
-| `src/manipulator_kinematics/model/transforms.py` | SE(3) helpers: elementary rotations, the skew matrix, the closed-form pose inverse, and the twist-valued pose error. |
-| `src/manipulator_kinematics/model/joints.py` | Joint limits, limit clamping, and limit-box sampling. |
-| `src/manipulator_kinematics/model/dh.py` | The `DHParameter` and `Robot` dataclasses, both DH conventions, and the reach bound used as a characteristic length. |
-| `src/manipulator_kinematics/model/robots.py` | Published parameter sets for the PUMA 560, the UR5, and the Stanford arm, each with its citation. |
-| `src/manipulator_kinematics/algorithm/forward.py` | Forward kinematics and the cumulative link frames. |
-| `src/manipulator_kinematics/algorithm/jacobian.py` | The geometric Jacobian, and a finite-difference Jacobian used only to validate it. |
-| `src/manipulator_kinematics/algorithm/conditioning.py` | Manipulability, condition number, and smallest singular value, on a dimensionally homogenised Jacobian. |
-| `src/manipulator_kinematics/algorithm/protocol.py` | The `IKSolver` protocol, the `IKResult` record, and the convergence tolerance. |
-| `src/manipulator_kinematics/algorithm/analytic.py` | Closed-form inverse kinematics for a 6R arm with a spherical wrist, plus the structure check that guards it. |
-| `src/manipulator_kinematics/algorithm/numerical.py` | The three update rules as free functions, and the three iterative solvers that wrap them. |
-| `src/manipulator_kinematics/pipeline/trace.py` | The trace dataclasses: targets, trials, campaigns, and singularity scans. |
-| `src/manipulator_kinematics/pipeline/runner.py` | Target and seed generation, the solver campaign, and the joint sweep. |
-| `src/manipulator_kinematics/analysis/metrics.py` | Per-solver summary statistics and the fixed-width text tables. |
-| `src/manipulator_kinematics/analysis/figures.py` | Convergence, success rate, and singularity figures, drawn on the Agg canvas without `pyplot`. |
-| `examples/` | Four wiring scripts, each of which parses flags, calls the library, and prints or saves. No logic. |
+| `model/transforms.py` | SE(3) helpers: elementary rotations, the skew matrix, the closed-form pose inverse, and the twist-valued pose error. |
+| `model/joints.py` | Joint limits, limit clamping, and limit-box sampling. |
+| `model/dh.py` | The `DHParameter` and `Robot` dataclasses, both DH conventions, and the reach bound used as a characteristic length. |
+| `model/robots.py` | Published parameter sets for the PUMA 560, the UR5, and the Stanford arm, each with its citation. |
+| `algorithm/forward.py` | Forward kinematics and the cumulative link frames. |
+| `algorithm/jacobian.py` | The geometric Jacobian, and a finite-difference Jacobian used only to validate it. |
+| `algorithm/conditioning.py` | Manipulability, condition number, and smallest singular value, on a dimensionally homogenised Jacobian. |
+| `algorithm/protocol.py` | The `IKSolver` protocol, the `IKResult` record, and the convergence tolerance. |
+| `algorithm/analytic.py` | Closed-form inverse kinematics for a 6R arm with a spherical wrist, plus the structure check that guards it. |
+| `algorithm/numerical.py` | The three update rules as free functions, the box-constrained active set that wraps any of them, and the three iterative solvers. |
+| `pipeline/trace.py` | The trace dataclasses: targets, trials, campaigns, and singularity scans. |
+| `pipeline/runner.py` | Target and seed generation, the solver campaign, and the joint sweep. |
+| `analysis/metrics.py` | Per-solver summaries, the failure diagnosis, and the fixed-width text tables. |
+| `analysis/figures.py` | Convergence, success, residual tail, and singularity figures, drawn on the Agg canvas without `pyplot`. |
+| `examples/` | Five wiring scripts. Each parses flags, calls the library, and prints or saves. No logic. |
 
 The model layer performs no input or output. The algorithm layer draws nothing.
 The pipeline layer decides nothing about what counts as a good result. The
 analysis layer calls no solver, so any figure can be redrawn from a recorded
 trace.
 
-## Testing
-
-```bash
-uv run pytest
-uv run ruff check .
-uv run mypy
-```
-
-The suite has three tiers: property and invariant tests covering the mathematics,
-regression tests pinning recorded behaviour, and integration tests running each
-example script under a reduced iteration count.
-
-Tier one, `tests/test_properties.py`, 54 tests. Every link transform and composed
-pose is orthonormal with determinant one. The analytic Jacobian matches a central
-finite difference of forward kinematics to 1e-7 on all three arms. Forward
-kinematics composed with the closed-form inverse returns the original pose to
-below 1e-9 on every branch. Hand-computed reference poses at the zero
-configuration are checked against the parameter tables for all three arms, and the
-prismatic joint of the Stanford arm is checked to translate the tool by exactly
-its own displacement. The two DH conventions are checked against each other by
-building the same chain twice.
-
-Tier two, `tests/test_regression.py`, 5 tests against `tests/data/reference.json`.
-A 25-point joint-space trajectory pins forward kinematics to 1e-12 and the three
-conditioning metrics to 1e-9 relative. Three poses pin the full eight-branch
-closed-form solution sets to 1e-9. Two 25-target solver campaigns pin the solved
-counts exactly, the per-trial iteration counts to within one, and the returned
-configurations to 1e-5. The file is regenerated with
-`uv run python tests/test_regression.py`, which is a deliberate act rather than an
-automatic one.
-
-Tier three, `tests/test_integration.py`, 7 tests. Every script in `examples/` is
-launched as a subprocess with reduced target counts, iteration budgets, and sweep
-resolutions, and must exit zero, print output, and write its promised figures into
-a temporary directory. One test asserts that no example script has been left out
-of the list, so a new example cannot silently escape coverage.
-
-The full suite of 66 tests runs in about 9 seconds.
+The alternatives that were considered and rejected, and the limitations that
+remain, are in [docs/design-notes.md](docs/design-notes.md).
 
 ## References
 
@@ -362,6 +431,10 @@ The full suite of 66 tests runs in about 9 seconds.
   Levenberg-Marquardt method", IEEE Transactions on Robotics 27(5), 2011, pages
   984 to 991. doi:10.1109/TRO.2011.2148230. The residual-scaled damping schedule,
   which is the default here.
+- C. L. Lawson and R. J. Hanson, *Solving Least Squares Problems*, Prentice-Hall,
+  1974. ISBN 978-0-13-822585-0. Chapter 23, the active-set method for a
+  least-squares problem with bounds, which is how the joint limit box is imposed
+  on every iterative step here.
 - T. Yoshikawa, "Manipulability of robotic mechanisms", International Journal of
   Robotics Research 4(2), 1985, pages 3 to 9. doi:10.1177/027836498500400201. The
   manipulability index.
@@ -385,7 +458,7 @@ alternatives that were considered and not implemented.
 - A. Liegeois, "Automatic supervisory control of the configuration and behavior of
   multibody mechanisms", IEEE Transactions on Systems, Man and Cybernetics 7(12),
   1977, pages 868 to 871. doi:10.1109/TSMC.1977.4309644. Null-space joint limit
-  avoidance.
+  avoidance, which is empty on a non-redundant arm.
 - K. P. Hawkins, "Analytic inverse kinematics for the Universal Robots UR-5 and
   UR-10 arms", Georgia Institute of Technology technical report, 2013.
   https://hdl.handle.net/1853/50782 . The arm-specific UR5 closed form.
@@ -421,6 +494,7 @@ alternatives that were considered and not implemented.
 | [SciPy](https://scipy.org/) | `scipy.linalg.svd` and `scipy.linalg.svdvals` for the singular value decompositions behind the conditioning metrics and the pseudoinverse, `scipy.linalg.solve` for the damped normal equations, and `scipy.spatial.transform.Rotation` for the rotation matrix logarithm used in the pose error. | BSD 3-Clause |
 | [Matplotlib](https://matplotlib.org/) | Figure drawing through the Agg canvas, without `pyplot` and therefore without any global state or interactive backend. | Matplotlib License, a BSD-style license |
 | [pytest](https://pytest.org/) | Test runner, development only. | MIT |
+| [pytest-cov](https://pytest-cov.readthedocs.io/) | Coverage measurement, development only. | MIT |
 | [Ruff](https://docs.astral.sh/ruff/) | Linting and import ordering, development only. | MIT |
 | [mypy](https://mypy-lang.org/) | Static type checking in strict mode over the package, the tests, and the examples, development only. | MIT |
 

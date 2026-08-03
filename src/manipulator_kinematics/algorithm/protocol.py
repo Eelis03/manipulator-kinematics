@@ -57,7 +57,9 @@ class IKResult:
         position_error: Euclidean position error at ``q``, in metres.
         orientation_error: Rotation angle error at ``q``, in radians.
         residuals: Norm of the full 6-vector pose error after each iteration,
-            starting with the value at the seed configuration.
+            starting with the value at the seed configuration. The last entry
+            belongs to the last iterate, which is not in general ``q``, because
+            ``q`` is the best iterate seen rather than the most recent one.
         message: Why the solver stopped.
     """
 
@@ -72,8 +74,13 @@ class IKResult:
 
     @property
     def final_residual(self) -> float:
-        """Norm of the pose error at ``q``."""
-        return self.residuals[-1]
+        """Norm of the pose error at ``q``, the configuration actually returned.
+
+        This is not ``residuals[-1]``. The trajectory may end somewhere worse
+        than the best point it passed through, and a result record should
+        describe the answer it hands back rather than the last place it looked.
+        """
+        return float(np.hypot(self.position_error, self.orientation_error))
 
 
 @runtime_checkable

@@ -1,4 +1,4 @@
-"""Tier three: every example script runs to completion.
+"""Every example script runs to completion.
 
 Each script is launched as a subprocess with the interpreter running the tests,
 so the test exercises the same entry point a reader would type. Iteration counts,
@@ -7,7 +7,8 @@ the scripts already expose, which keeps the whole tier inside a few seconds whil
 still running every code path the full run uses.
 
 Figures are written to a temporary directory, so a test run never touches the
-repository working tree.
+repository working tree. In particular the tracked figures under ``docs/figures``
+are never overwritten by a test run, only by the documented regeneration command.
 """
 
 from __future__ import annotations
@@ -28,6 +29,10 @@ EXAMPLE_INVOCATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("--robots", "puma560", "ur5", "--targets", "4", "--max-iterations", "12"),
     ),
     ("singularity_scan.py", ("--points", "21")),
+    (
+        "publish_figures.py",
+        ("--targets", "4", "--max-iterations", "12", "--points", "21"),
+    ),
 )
 
 

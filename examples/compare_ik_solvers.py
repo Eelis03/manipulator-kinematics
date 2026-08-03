@@ -24,6 +24,7 @@ from manipulator_kinematics.algorithm import (
 from manipulator_kinematics.algorithm.protocol import IKSolver
 from manipulator_kinematics.analysis import (
     convergence_figure,
+    format_failure_table,
     format_summary_table,
     save_figure,
     success_figure,
@@ -54,15 +55,38 @@ def main(argv: list[str] | None = None) -> int:
         help="damping rule used by the damped least squares solver",
     )
     parser.add_argument(
+        "--limit-strategy",
+        default="active-set",
+        choices=["clip", "active-set"],
+        help="how a step refused by a joint limit is handled",
+    )
+    parser.add_argument(
+        "--backtracking",
+        type=int,
+        default=6,
+        help="halvings tried when a step fails to reduce the residual, 0 to disable",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("outputs"),
         help="directory the figures are written to",
     )
+    parser.add_argument("--dpi", type=int, default=150, help="resolution of the saved figures")
+    parser.add_argument(
+        "--diagnose-failures",
+        action="store_true",
+        help="list every unsolved trial with its active bounds and conditioning",
+    )
     args = parser.parse_args(argv)
 
     tolerance = Tolerance(position=1e-6, orientation=1e-6)
-    settings = SolverSettings(max_iterations=args.max_iterations, tolerance=tolerance)
+    settings = SolverSettings(
+        max_iterations=args.max_iterations,
+        tolerance=tolerance,
+        active_set=args.limit_strategy == "active-set",
+        backtracking=args.backtracking,
+    )
     schedule = DampingSchedule(args.damping_schedule)
 
     for name in args.robots:
@@ -94,15 +118,24 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(targets)} reachable targets, seeds offset by {args.spread} rad, "
             f"iteration budget {args.max_iterations}, "
             f"tolerance {tolerance.position:g} m and {tolerance.orientation:g} rad, "
-            f"damping schedule {schedule.value}"
+            f"damping schedule {schedule.value}, "
+            f"limit strategy {args.limit_strategy}, backtracking {args.backtracking}"
         )
         print(format_summary_table(summaries))
         print()
+        if args.diagnose_failures:
+            print(format_failure_table(trace, robot.limits))
+            print()
 
-        save_figure(convergence_figure(trace), args.output_dir / f"{name}_convergence.png")
+        save_figure(
+            convergence_figure(trace),
+            args.output_dir / f"{name}_convergence.png",
+            dpi=args.dpi,
+        )
         save_figure(
             success_figure(summaries, robot=robot.name),
             args.output_dir / f"{name}_success.png",
+            dpi=args.dpi,
         )
 
     print(f"figures written to {args.output_dir.resolve()}")
