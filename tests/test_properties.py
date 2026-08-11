@@ -7,6 +7,8 @@ independent numerical route to the same quantity.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 import pytest
 
@@ -14,7 +16,9 @@ from manipulator_kinematics.algorithm import (
     AnalyticIK,
     DampedLeastSquaresIK,
     DampingSchedule,
+    IKResult,
     PseudoinverseIK,
+    RestartingIK,
     SolverSettings,
     Tolerance,
     active_set_step,
@@ -55,6 +59,7 @@ from manipulator_kinematics.model import (
     skew,
     stanford_arm,
     ur5,
+    within_limits,
 )
 
 TIGHT = 1e-9
@@ -818,6 +823,191 @@ def test_no_run_ends_worse_than_it_started(rng: np.random.Generator) -> None:
                 assert result.residuals[-1] <= result.residuals[0], (
                     f"{robot.name}/{solver.name} target {target.index}"
                 )
+
+
+# --------------------------------------------------------------------------
+# Random restart
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _CountingSolver:
+    """A solver that records the seed of every call before delegating it."""
+
+    inner: PseudoinverseIK
+    calls: list[np.ndarray] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        """Short identifier used in traces, tables and figures."""
+        return self.inner.name
+
+    def solve(self, robot: Robot, target: np.ndarray, seed: np.ndarray) -> IKResult:
+        """Record the starting configuration and hand the call on."""
+        self.calls.append(np.array(seed, dtype=np.float64))
+        return self.inner.solve(robot, target, seed)
+
+
+def _unreachable() -> np.ndarray:
+    """Return a pose far outside the workspace, so every start is bound to fail."""
+    target = np.eye(4, dtype=np.float64)
+    target[:3, 3] = [5.0, 5.0, 5.0]
+    return target
+
+
+def test_restarting_without_a_restart_budget_is_the_solver_it_wraps() -> None:
+    """A zero budget changes the label and nothing about the answer."""
+    robot = puma560()
+    q = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
+    target = forward_kinematics(robot, q)
+    inner = PseudoinverseIK(settings=SolverSettings(max_iterations=8))
+
+    direct = inner.solve(robot, target, _cornered(robot))
+    wrapped = RestartingIK(solver=inner, restarts=0).solve(robot, target, _cornered(robot))
+
+    assert wrapped.solver == "pseudoinverse-restart"
+    assert wrapped.converged == direct.converged
+    assert wrapped.iterations == direct.iterations
+    assert wrapped.message == direct.message
+    assert wrapped.residuals == direct.residuals
+    assert np.allclose(wrapped.q, direct.q, atol=0.0)
+
+
+def test_restarting_spends_one_call_on_a_target_the_seed_already_solves() -> None:
+    """A seed that converges is never followed by a restart."""
+    robot = puma560()
+    q = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
+    counted = _CountingSolver(inner=PseudoinverseIK(settings=SolverSettings(max_iterations=50)))
+
+    result = RestartingIK(solver=counted, restarts=8).solve(
+        robot, forward_kinematics(robot, q), q + 0.05
+    )
+
+    assert result.converged
+    assert result.message == "converged"
+    assert len(counted.calls) == 1
+
+
+def test_restarting_draws_every_fresh_start_from_inside_the_limit_box() -> None:
+    """A restart begins where the arm may stand, not where the last one stopped."""
+    robot = puma560()
+    counted = _CountingSolver(inner=PseudoinverseIK(settings=SolverSettings(max_iterations=6)))
+
+    result = RestartingIK(solver=counted, restarts=3, margin=0.1).solve(
+        robot, _unreachable(), _cornered(robot)
+    )
+
+    assert len(counted.calls) == 4
+    assert np.allclose(counted.calls[0], _cornered(robot), atol=0.0)
+    for start in counted.calls[1:]:
+        assert within_limits(start, robot.limits)
+    assert not result.converged
+    assert result.message == "iteration limit reached, best of 4 starts"
+
+
+def test_restarting_never_returns_a_worse_result_than_the_start_it_was_given(
+    rng: np.random.Generator,
+) -> None:
+    """Restarting cannot lose a solve, and until one is found it only lowers the residual.
+
+    Both halves are exact rather than statistical. The first attempt is the
+    wrapped call itself, and a later attempt replaces it only by converging or by
+    beating its residual, so the comparison holds target by target.
+    """
+    from manipulator_kinematics.pipeline import sample_targets
+
+    robot = puma560()
+    targets = sample_targets(robot, 8, rng, margin=0.15)
+    inner = PseudoinverseIK(settings=SolverSettings(max_iterations=100))
+    restarting = RestartingIK(solver=inner, restarts=3)
+    start = _cornered(robot)
+
+    for target in targets:
+        direct = inner.solve(robot, target.pose, start)
+        best = restarting.solve(robot, target.pose, start)
+        assert best.converged or not direct.converged, f"target {target.index}"
+        if not best.converged:
+            assert best.final_residual <= direct.final_residual, f"target {target.index}"
+
+
+def test_restarting_recovers_targets_a_single_start_cannot(rng: np.random.Generator) -> None:
+    """From the corner of the limit box, a fresh start solves what a better step cannot.
+
+    The corner is the case the design notes describe. The descent stops at a
+    Karush-Kuhn-Tucker point of the box-constrained problem, where no feasible
+    direction reduces the pose error and no held joint wants to be released, so
+    the step collapses however it is computed. Measured on this campaign, a
+    single start solved none of the 12 targets and four starts solved 11. The
+    margin asserted below sits well inside that gap, because the count is
+    evidence that restarting works and not a value any machine can promise
+    another.
+    """
+    from manipulator_kinematics.pipeline import sample_targets
+
+    robot = puma560()
+    targets = sample_targets(robot, 12, rng, margin=0.15)
+    inner = PseudoinverseIK(settings=SolverSettings(max_iterations=120))
+    restarting = RestartingIK(solver=inner, restarts=3)
+    start = _cornered(robot)
+
+    single = sum(inner.solve(robot, target.pose, start).converged for target in targets)
+    results = [restarting.solve(robot, target.pose, start) for target in targets]
+
+    assert sum(result.converged for result in results) >= single + 4
+    assert all(
+        result.message == "converged" or result.message.startswith("converged on start ")
+        for result in results
+        if result.converged
+    )
+    for result in results:
+        assert within_limits(result.q, robot.limits, tolerance=1e-12)
+
+
+def test_restarting_repeats_itself_and_a_new_generator_seed_starts_elsewhere() -> None:
+    """The generator is built inside the call, so one call is a function of its arguments."""
+    robot = puma560()
+    inner = PseudoinverseIK(settings=SolverSettings(max_iterations=4))
+    first, again, other = (_CountingSolver(inner=inner) for _ in range(3))
+
+    RestartingIK(solver=first, restarts=2).solve(robot, _unreachable(), _cornered(robot))
+    RestartingIK(solver=again, restarts=2).solve(robot, _unreachable(), _cornered(robot))
+    RestartingIK(solver=other, restarts=2, rng_seed=7).solve(
+        robot, _unreachable(), _cornered(robot)
+    )
+
+    assert np.allclose(np.array(first.calls), np.array(again.calls), atol=0.0)
+    assert not np.allclose(np.array(first.calls), np.array(other.calls), atol=1e-9)
+
+
+def test_restarting_displaces_the_seed_when_the_chain_declares_no_limits() -> None:
+    """Without a box to draw from, a restart is the given seed plus a Gaussian offset."""
+    limited = puma560()
+    unlimited = Robot(
+        name="puma560-unlimited",
+        links=tuple(
+            DHParameter(d=link.d, theta=link.theta, a=link.a, alpha=link.alpha)
+            for link in limited.links
+        ),
+    )
+    q = np.array([0.4, -1.1, 0.7, -0.5, 0.9, 0.3], dtype=np.float64)
+    inner = PseudoinverseIK(settings=SolverSettings(max_iterations=4))
+
+    still = _CountingSolver(inner=inner)
+    RestartingIK(solver=still, restarts=2, spread=0.0).solve(unlimited, _unreachable(), q)
+    assert len(still.calls) == 3
+    assert all(np.allclose(start, q, atol=0.0) for start in still.calls)
+
+    spread = _CountingSolver(inner=inner)
+    RestartingIK(solver=spread, restarts=2, spread=0.4).solve(unlimited, _unreachable(), q)
+    assert all(float(np.linalg.norm(start - q)) > 1e-6 for start in spread.calls[1:])
+
+
+def test_restarting_rejects_settings_it_cannot_honour() -> None:
+    """A negative budget and a margin that empties the box are refused where declared."""
+    with pytest.raises(ValueError, match="restarts must not be negative"):
+        RestartingIK(solver=PseudoinverseIK(), restarts=-1)
+    with pytest.raises(ValueError, match="margin must be at least zero and below a half"):
+        RestartingIK(solver=PseudoinverseIK(), margin=0.5)
 
 
 # --------------------------------------------------------------------------

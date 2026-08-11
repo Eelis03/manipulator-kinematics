@@ -37,6 +37,7 @@ from manipulator_kinematics.algorithm.numerical import (
     variable_damping,
 )
 from manipulator_kinematics.algorithm.protocol import IKResult, IKSolver, Tolerance
+from manipulator_kinematics.algorithm.restart import RestartingIK
 
 __all__ = [
     "AnalyticIK",
@@ -48,6 +49,7 @@ __all__ = [
     "IKSolver",
     "JacobianTransposeIK",
     "PseudoinverseIK",
+    "RestartingIK",
     "SolverSettings",
     "StructureError",
     "Tolerance",

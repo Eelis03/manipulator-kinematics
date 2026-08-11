@@ -298,8 +298,27 @@ rather than a cause.
 
 Escaping a constrained local minimum is a restart question, not a step question:
 a second seed, a homotopy in the target, or a global method. None of those is a
-better step rule, so none of them belongs in the update loop, and the library
-offers the damped solver instead, which solved every target on both arms.
+better step rule, so none of them belongs in the update loop. Two answers sit
+outside it instead. The first is the damped solver, which solved every target on
+both arms. The second is `RestartingIK`, which wraps any solver and runs it again
+from configurations drawn uniformly inside the limit box, in the manner of Beeson
+and Ames 2015, keeping the best attempt and stopping at the first that converges.
+
+Its guarantee is deliberately narrow, because a restart is a search and not a
+derivation. It never loses a target the wrapped solver already solves, since the
+first attempt is that call and the search ends there. Until an attempt converges
+it never returns a worse residual than the caller's own seed produced. It
+promises nothing about how many starts a given target needs, and nothing at all
+about a target that is genuinely unreachable, where every start fails and the
+budget is spent in full.
+
+The evidence that it is worth having is in `tests/test_properties.py` rather than
+in the results table above, because it is a property of a bad seed rather than of
+the campaign. Seeded at the lower corner of the PUMA 560 limit box, which strands
+the pseudoinverse at a constrained stationary point on almost every target, a
+single start solved none of the twelve targets drawn on seed 20260731 and four
+starts solved eleven. The one that remains is the honest part of the picture: a
+restart budget is a budget, and spending it is not the same as succeeding.
 
 ### The orientation error is discontinuous at a half turn
 

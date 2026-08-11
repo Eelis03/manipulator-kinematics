@@ -240,9 +240,14 @@ a bound at a well conditioned Jacobian, manipulability between 3.7336e-04 and
 8.2048e-03: these are genuine constrained local minima, reachable targets that
 cannot be reached from that seed without leaving the box on the way. The other
 four stop near a singularity, below 6.6887e-06. Escaping a constrained local
-minimum is a restart question rather than a step question, and it is recorded as
-a limitation in [docs/design-notes.md](docs/design-notes.md) rather than papered
-over.
+minimum is a restart question rather than a step question, so it is answered
+outside the update loop. `RestartingIK` wraps any solver and runs it again from
+configurations drawn inside the limit box until one attempt converges or the
+budget is spent. It cannot lose a target the wrapped solver already solves,
+because the first attempt is that call and the search stops at the first attempt
+that converges, and until one does it keeps the lowest residual it has seen. What
+that leaves, and why the update loop itself was left alone, is recorded in
+[docs/design-notes.md](docs/design-notes.md) rather than papered over.
 
 ### Eight closed-form branches, exact to round-off
 
@@ -347,7 +352,7 @@ uv run ruff format --check .
 uv run mypy
 ```
 
-134 tests in about 20 seconds, at 100 percent statement coverage of the package.
+142 tests in about 20 seconds, at 100 percent statement coverage of the package.
 CI runs the same command on Linux and Windows with `--cov-fail-under=98`.
 
 The suite is one file per layer, plus two that check the repository rather than
@@ -355,7 +360,7 @@ the mathematics.
 
 | File | Tests | What it establishes |
 | --- | --- | --- |
-| `tests/test_properties.py` | 85 | Mathematical facts. Every transform is orthonormal with determinant one. The analytic Jacobian matches a central finite difference on all three arms. Forward kinematics composed with the closed-form inverse returns the original pose on every branch. The two DH conventions are checked against each other by building the same chain twice. The constrained step serves the linear model better than clipping does, solves more targets than clipping does, and never ends a run above where it began. |
+| `tests/test_properties.py` | 93 | Mathematical facts. Every transform is orthonormal with determinant one. The analytic Jacobian matches a central finite difference on all three arms. Forward kinematics composed with the closed-form inverse returns the original pose on every branch. The two DH conventions are checked against each other by building the same chain twice. The constrained step serves the linear model better than clipping does, solves more targets than clipping does, and never ends a run above where it began. A restart never loses a solve the wrapped solver made and never returns a worse residual than the seed it was given. |
 | `tests/test_pipeline.py` | 11 | Target generation, campaigns, and the joint sweep, in process rather than through a script, so a failure names the function. |
 | `tests/test_analysis.py` | 23 | Summaries against hand computations, and figures read as artist trees rather than pixels, because the artists are reproducible across platforms and the pixels are not. |
 | `tests/test_regression.py` | 5 | Recorded behaviour pinned against `tests/data/reference.json`: a 25-point trajectory to 1e-12, three eight-branch solution sets to 1e-9, and two 25-target campaigns by solved count, iteration count and returned configuration. Regenerated deliberately with `uv run python tests/test_regression.py`. |
@@ -378,6 +383,7 @@ Five layers, each depending only on the ones above it.
 | `algorithm/protocol.py` | The `IKSolver` protocol, the `IKResult` record, and the convergence tolerance. |
 | `algorithm/analytic.py` | Closed-form inverse kinematics for a 6R arm with a spherical wrist, plus the structure check that guards it. |
 | `algorithm/numerical.py` | The three update rules as free functions, the box-constrained active set that wraps any of them, and the three iterative solvers. |
+| `algorithm/restart.py` | The multistart wrapper: any solver run again from fresh configurations while it keeps failing. |
 | `pipeline/trace.py` | The trace dataclasses: targets, trials, campaigns, and singularity scans. |
 | `pipeline/runner.py` | Target and seed generation, the solver campaign, and the joint sweep. |
 | `analysis/metrics.py` | Per-solver summaries, the failure diagnosis, and the fixed-width text tables. |
@@ -438,6 +444,10 @@ remain, are in [docs/design-notes.md](docs/design-notes.md).
   1974. ISBN 978-0-13-822585-0. Chapter 23, the active-set method for a
   least-squares problem with bounds, which is how the joint limit box is imposed
   on every iterative step here.
+- P. Beeson and B. Ames, "TRAC-IK: an open-source library for improved solving of
+  generic inverse kinematics", IEEE-RAS International Conference on Humanoid
+  Robots, 2015, pages 928 to 935. doi:10.1109/HUMANOIDS.2015.7363472. Restarting
+  a failed solve from configurations drawn inside the joint limit box.
 - T. Yoshikawa, "Manipulability of robotic mechanisms", International Journal of
   Robotics Research 4(2), 1985, pages 3 to 9. doi:10.1177/027836498500400201. The
   manipulability index.
