@@ -239,9 +239,7 @@ def residual_tail_figure(labelled: Sequence[tuple[str, Trace]], *, solver: str) 
         trials = trace.for_solver(solver)
         if not trials:
             raise ValueError(f"trace {trace.robot!r} holds no trials for solver {solver!r}")
-        residuals = np.sort(
-            np.maximum([trial.result.final_residual for trial in trials], 1e-16)
-        )
+        residuals = np.sort(np.maximum([trial.result.final_residual for trial in trials], 1e-16))
         missed = sum(not trial.result.converged for trial in trials)
         axes.plot(
             np.arange(1, residuals.size + 1),

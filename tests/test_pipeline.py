@@ -100,9 +100,7 @@ def test_campaign_records_one_trial_per_solver_and_target(rng: np.random.Generat
     solvers = [
         PseudoinverseIK(settings=SolverSettings(max_iterations=40, tolerance=TOLERANCE)),
     ]
-    trace = run_campaign(
-        robot, solvers, targets, seeds, tolerance=TOLERANCE, max_iterations=40
-    )
+    trace = run_campaign(robot, solvers, targets, seeds, tolerance=TOLERANCE, max_iterations=40)
     assert trace.robot == "puma560"
     assert trace.solvers == ("pseudoinverse",)
     assert len(trace.trials) == 5

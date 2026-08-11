@@ -119,9 +119,7 @@ def format_summary_table(summaries: tuple[SolverSummary, ...]) -> str:
     rule = "-" * len(header)
     lines = [header, rule]
     for item in summaries:
-        iterations = (
-            "n/a" if np.isnan(item.median_iterations) else f"{item.median_iterations:.0f}"
-        )
+        iterations = "n/a" if np.isnan(item.median_iterations) else f"{item.median_iterations:.0f}"
         lines.append(
             _row(
                 (

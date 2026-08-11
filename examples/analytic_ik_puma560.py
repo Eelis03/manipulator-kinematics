@@ -39,10 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     solutions = analytic_ik(robot, target)
-    header = (
-        f"{'branch':>22}  {'feasible':>8}  {'pos err (m)':>12}  "
-        f"{'rot err (rad)':>13}  q (rad)"
-    )
+    header = f"{'branch':>22}  {'feasible':>8}  {'pos err (m)':>12}  {'rot err (rad)':>13}  q (rad)"
     print(header)
     print("-" * len(header))
     for solution in solutions:

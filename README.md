@@ -4,7 +4,7 @@ Forward and inverse kinematics for serial manipulators, with Jacobian
 conditioning and singularity detection.
 
 [![CI](https://github.com/Eelis03/manipulator-kinematics/actions/workflows/ci.yml/badge.svg)](https://github.com/Eelis03/manipulator-kinematics/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ![Pose error against iteration for four inverse kinematics solvers on the PUMA 560 over 200 targets, with the Jacobian transpose crawling above the tolerance line for hundreds of iterations while the pseudoinverse and damped least squares drop below it within ten and the closed form reaches machine precision in one](docs/figures/puma560_convergence.png)
@@ -127,7 +127,9 @@ here, following Angeles 2007 section 4.9.
 
 ## Installation
 
-Requires Python 3.12 or later.
+Requires Python 3.12 or later. CI runs the whole suite on 3.12 and 3.13, on
+Linux and on Windows, so the version floor in `pyproject.toml` is a tested claim
+rather than a declared one.
 
 ```bash
 git clone https://github.com/Eelis03/manipulator-kinematics.git
@@ -346,6 +348,7 @@ The checks:
 ```bash
 uv run pytest --cov=src/manipulator_kinematics --cov-report=term-missing
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy
 ```
 

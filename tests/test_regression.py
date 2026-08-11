@@ -181,12 +181,8 @@ def _build_reference() -> dict[str, Any]:
                 "solvers": [
                     {
                         "name": name,
-                        "solved": sum(
-                            trial.result.converged for trial in trace.for_solver(name)
-                        ),
-                        "iterations": [
-                            trial.result.iterations for trial in trace.for_solver(name)
-                        ],
+                        "solved": sum(trial.result.converged for trial in trace.for_solver(name)),
+                        "iterations": [trial.result.iterations for trial in trace.for_solver(name)],
                         "converged": [
                             bool(trial.result.converged) for trial in trace.for_solver(name)
                         ],
@@ -253,9 +249,9 @@ def test_conditioning_trajectory_matches_the_reference(reference: dict[str, Any]
         q = np.array(record["q"], dtype=np.float64)
         metrics = conditioning(geometric_jacobian(robot, q), characteristic_length=length)
         for field in ("manipulability", "condition_number", "smallest_singular_value"):
-            assert getattr(metrics, field) == pytest.approx(
-                record[field], rel=1e-9
-            ), f"waypoint {index}, {field}"
+            assert getattr(metrics, field) == pytest.approx(record[field], rel=1e-9), (
+                f"waypoint {index}, {field}"
+            )
 
 
 def test_analytic_branches_match_the_reference(reference: dict[str, Any]) -> None:
@@ -266,9 +262,7 @@ def test_analytic_branches_match_the_reference(reference: dict[str, Any]) -> Non
         branches = _sorted_branches(analytic_ik(robot, forward_kinematics(robot, q)))
         expected = record["branches"]
         assert len(branches) == len(expected), f"pose {index}"
-        assert np.allclose(
-            np.array(branches), np.array(expected), atol=1e-9
-        ), f"pose {index}"
+        assert np.allclose(np.array(branches), np.array(expected), atol=1e-9), f"pose {index}"
 
 
 def test_campaign_matches_the_reference(reference: dict[str, Any]) -> None:
@@ -312,9 +306,9 @@ def test_campaign_matches_the_reference(reference: dict[str, Any]) -> None:
 
             solutions = np.array([trial.result.q for trial in trials], dtype=np.float64)
             expected_solutions = np.array(record["solutions"], dtype=np.float64)
-            assert np.allclose(
-                solutions[converged], expected_solutions[converged], atol=1e-5
-            ), f"{label}: converged solutions"
+            assert np.allclose(solutions[converged], expected_solutions[converged], atol=1e-5), (
+                f"{label}: converged solutions"
+            )
 
             for index, trial in enumerate(trials):
                 if trial.result.converged:
