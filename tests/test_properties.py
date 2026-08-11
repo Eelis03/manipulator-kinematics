@@ -60,9 +60,7 @@ from manipulator_kinematics.model import (
 TIGHT = 1e-9
 
 
-def _random_configurations(
-    robot: Robot, rng: np.random.Generator, count: int
-) -> list[np.ndarray]:
+def _random_configurations(robot: Robot, rng: np.random.Generator, count: int) -> list[np.ndarray]:
     return [sample_within_limits(robot.limits, rng, margin=0.05) for _ in range(count)]
 
 
@@ -224,8 +222,7 @@ def test_modified_convention_reproduces_the_standard_chain() -> None:
     standard = Robot(
         name="standard-chain",
         links=tuple(
-            DHParameter(d=d, theta=theta, a=a, alpha=alpha)
-            for d, theta, a, alpha in standard_rows
+            DHParameter(d=d, theta=theta, a=a, alpha=alpha) for d, theta, a, alpha in standard_rows
         ),
         convention=DHConvention.STANDARD,
     )
@@ -308,9 +305,7 @@ def test_jacobian_predicts_the_pose_change(robot: Robot, rng: np.random.Generato
 # --------------------------------------------------------------------------
 
 
-def test_manipulability_equals_the_determinant_form(
-    robot: Robot, rng: np.random.Generator
-) -> None:
+def test_manipulability_equals_the_determinant_form(robot: Robot, rng: np.random.Generator) -> None:
     """The product of singular values equals ``sqrt(det(J J^T))``."""
     for q in _random_configurations(robot, rng, 5):
         jacobian = geometric_jacobian(robot, q)
@@ -701,9 +696,7 @@ def test_a_solver_ignoring_the_limits_leaves_the_box() -> None:
     robot = puma560()
     q = np.array([0.2, -0.8, 0.5, 0.3, 0.6, -0.1], dtype=np.float64)
     settings = SolverSettings(max_iterations=60, respect_limits=False)
-    result = PseudoinverseIK(settings=settings).solve(
-        robot, forward_kinematics(robot, q), q + 0.2
-    )
+    result = PseudoinverseIK(settings=settings).solve(robot, forward_kinematics(robot, q), q + 0.2)
     assert result.converged
 
 

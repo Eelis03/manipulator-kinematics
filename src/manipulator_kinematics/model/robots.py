@@ -43,9 +43,7 @@ _STANFORD_SOURCE: Final[str] = (
 
 
 def _degree_limits(pairs: tuple[tuple[float, float], ...]) -> tuple[JointLimit, ...]:
-    return tuple(
-        JointLimit(float(np.deg2rad(low)), float(np.deg2rad(high))) for low, high in pairs
-    )
+    return tuple(JointLimit(float(np.deg2rad(low)), float(np.deg2rad(high))) for low, high in pairs)
 
 
 def puma560(*, tool_offset: float = 0.0) -> Robot:

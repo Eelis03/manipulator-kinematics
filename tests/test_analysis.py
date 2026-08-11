@@ -73,9 +73,7 @@ def _trace(solvers: tuple[str, ...], results: list[IKResult], *, robot: str = "t
         targets=tuple(
             Target(index=index, pose=np.eye(4, dtype=np.float64)) for index in range(count)
         ),
-        trials=tuple(
-            _trial(result, index % count) for index, result in enumerate(results)
-        ),
+        trials=tuple(_trial(result, index % count) for index, result in enumerate(results)),
     )
 
 
@@ -86,8 +84,9 @@ def _campaign_trace() -> Trace:
         for index in range(4)
     ]
     slow = [
-        _result("slow", converged=False, iterations=50, position=0.1 * (index + 1),
-                orientation=0.01)
+        _result(
+            "slow", converged=False, iterations=50, position=0.1 * (index + 1), orientation=0.01
+        )
         for index in range(4)
     ]
     return _trace(("fast", "slow"), [*fast, *slow])
@@ -121,18 +120,22 @@ def test_summarise_takes_iterations_over_converged_trials_only() -> None:
 
 def test_summarise_reports_not_a_number_when_nothing_converged() -> None:
     """A solver that never converged has no iteration statistic to report."""
-    (summary,) = summarise(_trace(("slow",), [
-        _result("slow", converged=False, iterations=50, position=0.2, orientation=0.02)
-    ]))
+    (summary,) = summarise(
+        _trace(
+            ("slow",),
+            [_result("slow", converged=False, iterations=50, position=0.2, orientation=0.02)],
+        )
+    )
     assert np.isnan(summary.median_iterations)
     assert "n/a" in format_summary_table((summary,))
 
 
 def test_summarise_skips_a_solver_with_no_trials() -> None:
     """A name in ``solvers`` with nothing recorded produces no row."""
-    trace = _trace(("present", "absent"), [
-        _result("present", converged=True, iterations=1, position=1e-9, orientation=1e-9)
-    ])
+    trace = _trace(
+        ("present", "absent"),
+        [_result("present", converged=True, iterations=1, position=1e-9, orientation=1e-9)],
+    )
     assert [item.solver for item in summarise(trace)] == ["present"]
 
 
@@ -147,9 +150,12 @@ def test_worst_residual_is_the_error_of_the_returned_configuration() -> None:
 
 def test_success_rate_of_an_empty_summary_is_zero() -> None:
     """A summary over no trials reports zero rather than dividing by zero."""
-    (summary,) = summarise(_trace(("solo",), [
-        _result("solo", converged=True, iterations=1, position=0.0, orientation=0.0)
-    ]))
+    (summary,) = summarise(
+        _trace(
+            ("solo",),
+            [_result("solo", converged=True, iterations=1, position=0.0, orientation=0.0)],
+        )
+    )
     empty = type(summary)(
         solver="none",
         trials=0,
@@ -227,9 +233,9 @@ def test_failure_table_counts_the_joints_pressed_against_a_bound() -> None:
 def test_failure_table_says_so_when_nothing_failed() -> None:
     """A clean campaign gets a sentence rather than an empty table."""
     limits = tuple(JointLimit(-1.0, 1.0) for _ in range(6))
-    clean = _trace(("fast",), [
-        _result("fast", converged=True, iterations=2, position=1e-9, orientation=1e-9)
-    ])
+    clean = _trace(
+        ("fast",), [_result("fast", converged=True, iterations=2, position=1e-9, orientation=1e-9)]
+    )
     assert format_failure_table(clean, limits) == "every trial converged"
 
 
@@ -307,9 +313,10 @@ def test_convergence_figure_labels_one_median_curve_per_solver() -> None:
 
 def test_convergence_figure_skips_a_solver_with_no_trials() -> None:
     """A declared solver that recorded nothing contributes no curve."""
-    trace = _trace(("present", "absent"), [
-        _result("present", converged=True, iterations=3, position=1e-9, orientation=1e-9)
-    ])
+    trace = _trace(
+        ("present", "absent"),
+        [_result("present", converged=True, iterations=3, position=1e-9, orientation=1e-9)],
+    )
     (axes,) = convergence_figure(trace).axes
     assert [line.get_label() for line in axes.lines if line.get_label() == "absent"] == []
 

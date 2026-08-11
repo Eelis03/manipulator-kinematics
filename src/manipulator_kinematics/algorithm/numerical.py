@@ -403,9 +403,7 @@ def _iterate(
             message = "step size collapsed"
             break
 
-        q, error = _advance(
-            robot, target, q, delta, limits, residuals[-1], settings.backtracking
-        )
+        q, error = _advance(robot, target, q, delta, limits, residuals[-1], settings.backtracking)
         iterations += 1
         residual = float(np.linalg.norm(error))
         residuals.append(residual)

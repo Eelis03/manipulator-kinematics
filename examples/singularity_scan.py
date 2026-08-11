@@ -23,9 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--points", type=int, default=401, help="samples across the sweep")
     parser.add_argument("--span", type=float, default=0.3, help="half-width of the sweep, in rad")
     parser.add_argument("--damping", type=float, default=0.05, help="maximum damping factor")
-    parser.add_argument(
-        "--epsilon", type=float, default=0.05, help="width of the singular region"
-    )
+    parser.add_argument("--epsilon", type=float, default=0.05, help="width of the singular region")
     parser.add_argument(
         "--output-dir",
         type=Path,

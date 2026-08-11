@@ -269,9 +269,7 @@ def analytic_ik(
                     shoulder=shoulder,
                     elbow=elbow,
                     wrist=wrist,
-                    feasible=(
-                        within_limits(q, robot.limits) if robot.has_limits else True
-                    ),
+                    feasible=(within_limits(q, robot.limits) if robot.has_limits else True),
                     position_error=float(np.linalg.norm(residual[:3])),
                     orientation_error=float(np.linalg.norm(residual[3:])),
                 )

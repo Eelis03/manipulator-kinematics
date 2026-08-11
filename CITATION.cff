@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Manipulator Kinematics"
+abstract: >-
+  Forward and inverse kinematics for serial manipulators, with the Jacobian
+  conditioning and singularity detection needed to say which solver a given arm
+  and target set actually calls for, measured over published parameter sets
+  rather than argued from taste.
+type: software
+authors:
+  - family-names: Yilmaz
+    given-names: Emre
+repository-code: "https://github.com/Eelis03/manipulator-kinematics"
+license: MIT
+version: "0.1.0"
+date-released: "2026-08-11"
+keywords:
+  - robotics
+  - kinematics
+  - inverse-kinematics
+  - manipulator
+  - python
